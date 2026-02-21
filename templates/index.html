@@ -1,0 +1,881 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Minimal Tool Chat UI</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "SF Mono", "Consolas", "Liberation Mono", monospace;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #020617;
+        color: #e5e7eb;
+      }
+      h1, h2 {
+        margin: 0 0 10px 0;
+      }
+      .grid {
+        display: grid;
+        gap: 14px;
+      }
+      .card {
+        background: #0f172a;
+        border: 1px solid #334155;
+        padding: 12px;
+        border-radius: 8px;
+      }
+      label {
+        display: block;
+        margin: 6px 0;
+      }
+      input, textarea, button {
+        width: 100%;
+        box-sizing: border-box;
+        font: inherit;
+      }
+      input, textarea {
+        border: 1px solid #334155;
+        border-radius: 6px;
+        padding: 8px;
+        background: #020617;
+        color: #e5e7eb;
+      }
+      textarea {
+        min-height: 120px;
+      }
+      button {
+        border: 1px solid #475569;
+        border-radius: 6px;
+        background: #1e293b;
+        color: #f8fafc;
+        padding: 10px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #0f172a;
+        color: #e5e7eb;
+      }
+      .row {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 1fr 1fr;
+      }
+      .checkbox-grid {
+        display: grid;
+        gap: 6px;
+        margin-top: 8px;
+        grid-template-columns: 1fr 1fr;
+      }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0;
+      }
+      .checkbox-row input {
+        width: auto;
+      }
+      .pill {
+        display: inline-block;
+        margin: 3px 6px 3px 0;
+        border: 1px solid #334155;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 12px;
+        background: #111827;
+      }
+      .tool-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin: 4px 0;
+      }
+      .tool-remove {
+        width: auto;
+        padding: 4px 8px;
+        font-size: 12px;
+        background: #7f1d1d;
+        border-color: #991b1b;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: 1px solid #334155;
+        border-radius: 6px;
+        background: #020617;
+        padding: 8px;
+      }
+      #chat-log {
+        max-height: 75vh;
+        overflow-y: auto;
+      }
+      .meta {
+        font-size: 12px;
+      }
+      .nav-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: #020617;
+        padding: 8px 0;
+        margin-bottom: 10px;
+      }
+      .nav-bar h1 {
+        margin: 0;
+        flex: 1;
+      }
+      .nav-btn {
+        width: auto;
+        padding: 4px 12px;
+        font-size: 18px;
+        line-height: 1;
+        background: #1e293b;
+        border: 1px solid #475569;
+        border-radius: 6px;
+        color: #f8fafc;
+        cursor: pointer;
+      }
+      .nav-btn:disabled {
+        opacity: 0.3;
+        cursor: default;
+      }
+      .chat-input-bar {
+        position: sticky;
+        bottom: 0;
+        z-index: 100;
+        background: #020617;
+        padding: 8px 0;
+      }
+      @media (max-width: 800px) {
+        .row {
+          grid-template-columns: 1fr;
+        }
+        .checkbox-grid {
+          grid-template-columns: 1fr;
+        }
+        #chat-log {
+          max-height: 60vh;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="nav-bar">
+      <button class="nav-btn" id="nav-left" type="button" disabled>&larr;</button>
+      <button class="nav-btn" id="nav-up" type="button" disabled>&uarr;</button>
+      <h1>Minimal Flask Tool Chat</h1>
+      <button class="nav-btn" id="nav-down" type="button" disabled>&darr;</button>
+      <button class="nav-btn" id="nav-right" type="button" disabled>&rarr;</button>
+    </div>
+    <div class="meta" id="meta"></div>
+    <div class="grid">
+      <section class="card">
+        <h2>Model Config</h2>
+        <form id="config-form">
+          <label>
+            Base URL
+            <input id="base_url" required>
+          </label>
+          <label>
+            API Key
+            <input id="api_key" placeholder="optional">
+          </label>
+          <label>
+            Workspace Path
+            <input id="workspace_path" placeholder="/path/to/project">
+          </label>
+          <label>
+            Model
+            <input id="model" required>
+          </label>
+          <div class="checkbox-grid">
+            <label class="checkbox-row">
+              <input id="builtin_pwd" type="checkbox">
+              <span>Enable pwd tool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="builtin_ls" type="checkbox">
+              <span>Enable ls tool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="builtin_rg" type="checkbox">
+              <span>Enable rg tool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="builtin_rg_files" type="checkbox">
+              <span>Enable rg_files tool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="builtin_browse" type="checkbox">
+              <span>Enable browse tool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="builtin_search" type="checkbox">
+              <span>Enable search tool</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="builtin_edit" type="checkbox">
+              <span>Enable edit tool</span>
+            </label>
+          </div>
+          <div class="meta"><code>browse</code> + <code>edit</code> use <code>path</code> as string-array segments.</div>
+          <button type="submit">Save Config</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Tools</h2>
+        <div id="tool-list"></div>
+        <form id="tool-form">
+          <div class="row">
+            <label>
+              Tool Name
+              <input id="tool_name" placeholder="square_the_number" required>
+            </label>
+            <label>
+              Description
+              <input id="tool_description" placeholder="output the square of the number." required>
+            </label>
+          </div>
+          <label>
+            Parameters JSON
+            <textarea id="tool_parameters" required>{
+  "type": "object",
+  "required": ["input_num"],
+  "properties": {
+    "input_num": {
+      "type": "number",
+      "description": "input_num is a number that will be squared"
+    }
+  }
+}</textarea>
+          </label>
+          <label>
+            Python Tool Code
+            <textarea id="tool_code" required>def square_the_number(input_num: float) -> dict:
+    return {"result": input_num ** 2}</textarea>
+          </label>
+          <button type="submit">Add / Update Tool</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Chat</h2>
+        <button class="secondary" id="clear-history" type="button">Clear History</button>
+        <pre id="chat-log"></pre>
+        <div class="meta" id="chat-context-size">context_tokens~unknown</div>
+      </section>
+
+      <section class="card">
+        <h2>Status</h2>
+        <pre id="status"></pre>
+      </section>
+    </div>
+
+    <div class="chat-input-bar">
+      <form id="chat-form">
+        <div class="row">
+          <input id="chat_input" placeholder="square the number 1024" required>
+          <button type="submit">Send</button>
+          <button class="secondary" id="continue-stream" type="button">Continue</button>
+          <button class="secondary" id="stop-stream" type="button" disabled>Stop</button>
+        </div>
+      </form>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const statusEl = $("status");
+      let cachedState = null;
+      let isStreaming = false;
+      let currentContextTokens = Number.NaN;
+      let activeStreamController = null;
+      let parentUUID = null;
+      let childUUID = null;
+      let prevSiblingUUID = null;
+      let nextSiblingUUID = null;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      async function api(path, method = "GET", body = null) {
+        const res = await fetch(path, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          body: body ? JSON.stringify(body) : null
+        });
+        const payload = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+        if (!res.ok || payload.ok === false) {
+          throw new Error(payload.error || `HTTP ${res.status}`);
+        }
+        return payload;
+      }
+
+      async function readResponseError(res) {
+        const text = await res.text();
+        if (!text) return `HTTP ${res.status}`;
+        try {
+          const payload = JSON.parse(text);
+          return payload.error || text;
+        } catch (_) {
+          return text;
+        }
+      }
+
+      function truncateText(value, maxChars = 220) {
+        const text = String(value ?? "");
+        if (text.length <= maxChars) return text;
+        return `${text.slice(0, maxChars)}...`;
+      }
+
+      function formatToolOutputValue(value) {
+        if (value === null || value === undefined) {
+          return "";
+        }
+        if (typeof value === "string") {
+          return value;
+        }
+        if (typeof value === "object") {
+          if (Object.prototype.hasOwnProperty.call(value, "output")) {
+            return formatToolOutputValue(value.output);
+          }
+          if (Object.prototype.hasOwnProperty.call(value, "result")) {
+            return formatToolOutputValue(value.result);
+          }
+          try {
+            return JSON.stringify(value, null, 2);
+          } catch (_) {
+            return String(value);
+          }
+        }
+        return String(value);
+      }
+
+      function formatToolOutput(content) {
+        if (typeof content === "string") {
+          try {
+            return formatToolOutputValue(JSON.parse(content));
+          } catch (_) {
+            return content;
+          }
+        }
+        return formatToolOutputValue(content);
+      }
+
+      function getHashStateUUID() {
+        const raw = window.location.hash.replace(/^#/, "").trim();
+        return raw || "";
+      }
+
+      function setHashStateUUID(stateUUID, mode = "replace", force = false) {
+        if (!stateUUID) return;
+        if (mode === "none") return;
+        const nextHash = `#${stateUUID}`;
+        if (window.location.hash === nextHash && !force) return;
+        if (mode === "push") {
+          history.pushState(null, "", nextHash);
+          return;
+        }
+        history.replaceState(null, "", nextHash);
+      }
+
+      function buildPartialAssistantText(liveTimeline) {
+        if (!Array.isArray(liveTimeline) || liveTimeline.length === 0) {
+          return "";
+        }
+        const lines = [];
+        liveTimeline.forEach((entry) => {
+          if (!entry || typeof entry !== "object") return;
+          if (entry.type === "assistant") {
+            lines.push(String(entry.text || ""));
+            return;
+          }
+          if (entry.type === "tool_call") {
+            lines.push(`\n[tool_call] ${entry.tool_name}(${entry.arguments || "{}"})`);
+            return;
+          }
+          if (entry.type === "tool_result") {
+            lines.push("[tool]");
+            lines.push(String(entry.output || ""));
+          }
+        });
+        return lines.join("\n").trim();
+      }
+
+      async function persistAbortedStream() {
+        const currentUUID = getHashStateUUID();
+        if (currentUUID) {
+          await refresh(currentUUID, "none");
+        } else {
+          await refresh("", "none");
+        }
+      }
+
+      function renderMeta(payload) {
+        $("meta").textContent = `state_uuid=${payload.state_uuid} | state_hash=${payload.state_hash} | events=${payload.event_count}`;
+      }
+
+      function renderContextSize(extra = "") {
+        const base = Number.isFinite(currentContextTokens)
+          ? `context_tokens~${currentContextTokens}`
+          : "context_tokens~unknown";
+        $("chat-context-size").textContent = `${base}${extra}`;
+      }
+
+      function chatLogIsNearBottom(thresholdPx = 8) {
+        const el = $("chat-log");
+        const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+        return distance <= thresholdPx;
+      }
+
+      function setChatLogText(text) {
+        const el = $("chat-log");
+        const wasNearBottom = chatLogIsNearBottom();
+        const prevScrollTop = el.scrollTop;
+        el.textContent = text;
+        if (wasNearBottom) {
+          el.scrollTop = el.scrollHeight;
+          return;
+        }
+        const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.min(prevScrollTop, maxScrollTop);
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function renderToolList(tools, builtinTools) {
+        const names = Object.keys(tools);
+        const enabledBuiltins = Object.entries(builtinTools || {})
+          .filter(([, enabled]) => Boolean(enabled))
+          .map(([name]) => name);
+
+        if (names.length === 0 && enabledBuiltins.length === 0) {
+          $("tool-list").innerHTML = "<p>No tools added yet.</p>";
+          return;
+        }
+
+        const customHtml = names
+          .map((name) => {
+            const escapedName = escapeHtml(name);
+            const encodedName = encodeURIComponent(name);
+            return `<div class="tool-row"><span class="pill">${escapedName}</span><button class="tool-remove" type="button" data-tool-name="${encodedName}">Remove</button></div>`;
+          })
+          .join("");
+
+        const builtinHtml = enabledBuiltins
+          .map((name) => `<span class="pill">${escapeHtml(name)} (builtin)</span>`)
+          .join("");
+
+        $("tool-list").innerHTML = customHtml + builtinHtml;
+      }
+
+      function chatLinesFromHistory(history) {
+        if (!history || history.length === 0) {
+          return [];
+        }
+        const lines = [];
+        history.forEach((msg, idx) => {
+          if (msg.role === "tool") {
+            lines.push(`[${idx}] tool:`);
+            const toolOutput = formatToolOutput(msg.content);
+            const outputLines = String(toolOutput).split("\n");
+            outputLines.forEach((line) => lines.push(line));
+            return;
+          }
+
+          const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+          lines.push(`[${idx}] ${msg.role}: ${content}`);
+          if (msg.tool_calls) {
+            msg.tool_calls.forEach((tc) => {
+              lines.push(`  tool_call -> ${tc.function.name}(${tc.function.arguments})`);
+            });
+          }
+        });
+        return lines;
+      }
+
+      function renderChat(history) {
+        const lines = chatLinesFromHistory(history);
+        setChatLogText(lines.length > 0 ? lines.join("\n") : "No messages yet.");
+      }
+
+      async function streamChatRequest(userInput, continueOnly = false) {
+        const controller = new AbortController();
+        activeStreamController = controller;
+        let liveTimeline = [];
+        try {
+          const res = await fetch("/api/chat/stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: userInput, continue: continueOnly, state_uuid: getHashStateUUID() }),
+            signal: controller.signal
+          });
+          if (!res.ok) {
+            throw new Error(await readResponseError(res));
+          }
+          if (!res.body) {
+            throw new Error("Streaming response body not available in this browser.");
+          }
+
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          const baseHistory = Array.isArray(cachedState?.history) ? cachedState.history : [];
+          liveTimeline = [];
+
+          const addDelta = (text) => {
+            const piece = String(text || "");
+            const last = liveTimeline[liveTimeline.length - 1];
+            if (last && last.type === "assistant") {
+              last.text += piece;
+            } else {
+              liveTimeline.push({ type: "assistant", text: piece });
+            }
+          };
+
+          let mergePrefix = "";
+          let mergeBaseHistory = baseHistory;
+          if (continueOnly && baseHistory.length > 0 && baseHistory[baseHistory.length - 1].role === "assistant") {
+            mergePrefix = baseHistory[baseHistory.length - 1].content || "";
+            mergeBaseHistory = baseHistory.slice(0, -1);
+          }
+
+          const renderLive = () => {
+            const lines = chatLinesFromHistory(mergeBaseHistory);
+            if (lines.length > 0) {
+              lines.push("");
+            }
+            if (!continueOnly) {
+              lines.push(`user: ${userInput}`);
+            }
+
+            if (liveTimeline.length === 0) {
+              lines.push(`assistant: ${mergePrefix}...`);
+            } else {
+              let firstAssistant = true;
+              liveTimeline.forEach((entry) => {
+                if (entry.type === "assistant") {
+                  const prefix = firstAssistant ? mergePrefix : "";
+                  firstAssistant = false;
+                  lines.push(`assistant: ${prefix}${entry.text || "..."}`);
+                } else if (entry.type === "tool_call") {
+                  lines.push(`tool_call -> ${entry.tool_name}(${entry.arguments || "{}"})`);
+                } else if (entry.type === "tool_result") {
+                  lines.push("tool:");
+                  const outputLines = String(entry.output || "").split("\n");
+                  outputLines.forEach((line) => lines.push(line));
+                }
+              });
+            }
+
+            setChatLogText(lines.join("\n"));
+          };
+
+          const handleEvent = async (evt) => {
+            if (!evt || typeof evt !== "object") return false;
+            if (evt.type === "snapshot") {
+              setHashStateUUID(evt.state_uuid, "replace");
+              return false;
+            }
+            if (evt.type === "delta") {
+              addDelta(evt.content);
+              renderLive();
+              return false;
+            }
+            if (evt.type === "tool_call") {
+              liveTimeline.push({
+                type: "tool_call",
+                tool_name: evt.tool_name,
+                arguments: evt.arguments || "{}"
+              });
+              renderLive();
+              return false;
+            }
+            if (evt.type === "tool_result") {
+              const output = formatToolOutput(evt.result ?? {});
+              liveTimeline.push({
+                type: "tool_result",
+                output
+              });
+              renderLive();
+              return false;
+            }
+            if (evt.type === "done") {
+              // Commit the exact persisted snapshot hash for this completed message.
+              setHashStateUUID(evt.state_uuid, "push");
+              await refresh(evt.state_uuid, "none");
+              setStatus("");
+              return true;
+            }
+            if (evt.type === "error") {
+              throw new Error(evt.error || "Streaming request failed.");
+            }
+            return false;
+          };
+
+          renderLive();
+          renderContextSize(" (streaming)");
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              buffer += decoder.decode();
+            } else {
+              buffer += decoder.decode(value, { stream: true });
+            }
+
+            let newlineIndex = buffer.indexOf("\n");
+            while (newlineIndex >= 0) {
+              const line = buffer.slice(0, newlineIndex).trim();
+              buffer = buffer.slice(newlineIndex + 1);
+              if (line) {
+                const evt = JSON.parse(line);
+                const finished = await handleEvent(evt);
+                if (finished) return;
+              }
+              newlineIndex = buffer.indexOf("\n");
+            }
+
+            if (done) {
+              break;
+            }
+          }
+
+          if (buffer.trim()) {
+            const evt = JSON.parse(buffer.trim());
+            const finished = await handleEvent(evt);
+            if (finished) return;
+          }
+          throw new Error("Stream ended before completion event.");
+        } catch (err) {
+          if (err && err.name === "AbortError") {
+            await persistAbortedStream();
+            return { aborted: true };
+          }
+          throw err;
+        } finally {
+          if (activeStreamController === controller) {
+            activeStreamController = null;
+          }
+        }
+      }
+
+      async function refresh(preferredStateUUID = "", historyMode = "replace") {
+        const hashStateUUID = preferredStateUUID || getHashStateUUID();
+        let payload;
+
+        if (hashStateUUID) {
+          try {
+            payload = await api(`/api/state?state_uuid=${encodeURIComponent(hashStateUUID)}`);
+          } catch (_) {
+            payload = await api("/api/state");
+            setStatus("");
+          }
+        } else {
+          payload = await api("/api/state");
+        }
+
+        cachedState = payload.state;
+        parentUUID = payload.parent_state_uuid || null;
+        childUUID = payload.child_state_uuid || null;
+        prevSiblingUUID = payload.prev_sibling_uuid || null;
+        nextSiblingUUID = payload.next_sibling_uuid || null;
+        $("nav-left").disabled = !prevSiblingUUID;
+        $("nav-up").disabled = !parentUUID;
+        $("nav-down").disabled = !childUUID;
+        $("nav-right").disabled = !nextSiblingUUID;
+        setHashStateUUID(payload.state_uuid, historyMode);
+        renderMeta(payload);
+        currentContextTokens = Number(payload.context_tokens_estimate);
+        renderContextSize();
+        renderToolList(cachedState.tools, cachedState.config.builtin_tools || {});
+        renderChat(cachedState.history);
+
+        $("base_url").value = cachedState.config.base_url;
+        $("api_key").value = cachedState.config.api_key;
+        $("workspace_path").value = cachedState.config.workspace_path || "";
+        $("model").value = cachedState.config.model;
+        const builtin = cachedState.config.builtin_tools || {};
+        $("builtin_pwd").checked = Boolean(builtin.pwd);
+        $("builtin_ls").checked = Boolean(builtin.ls);
+        $("builtin_rg").checked = Boolean(builtin.rg);
+        $("builtin_rg_files").checked = Boolean(builtin.rg_files);
+        $("builtin_browse").checked = Boolean(builtin.browse || builtin.query || builtin.rust_ast_query);
+        $("builtin_search").checked = Boolean(builtin.search);
+        $("builtin_edit").checked = Boolean(builtin.edit);
+      }
+
+      $("config-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        try {
+          const payload = await api("/api/config", "POST", {
+            base_url: $("base_url").value.trim(),
+            api_key: $("api_key").value.trim(),
+            workspace_path: $("workspace_path").value.trim(),
+            model: $("model").value.trim(),
+            builtin_tools: {
+              pwd: $("builtin_pwd").checked,
+              ls: $("builtin_ls").checked,
+              rg: $("builtin_rg").checked,
+              rg_files: $("builtin_rg_files").checked,
+              browse: $("builtin_browse").checked,
+              search: $("builtin_search").checked,
+              edit: $("builtin_edit").checked
+            }
+          });
+          await refresh(payload.state_uuid, "push");
+          setStatus("");
+        } catch (err) {
+          setStatus(`Config error: ${err.message}`);
+        }
+      });
+
+      $("tool-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        try {
+          const payload = await api("/api/tools", "POST", {
+            name: $("tool_name").value.trim(),
+            description: $("tool_description").value.trim(),
+            parameters: $("tool_parameters").value,
+            implementation_code: $("tool_code").value
+          });
+          await refresh(payload.state_uuid, "push");
+          setStatus("");
+        } catch (err) {
+          setStatus(`Tool error: ${err.message}`);
+        }
+      });
+
+      $("tool-list").addEventListener("click", async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const button = target.closest("button[data-tool-name]");
+        if (!(button instanceof HTMLElement)) return;
+
+        const encodedName = button.getAttribute("data-tool-name");
+        if (!encodedName) return;
+        const toolName = decodeURIComponent(encodedName);
+
+        try {
+          const payload = await api(`/api/tools/${encodeURIComponent(toolName)}`, "DELETE");
+          await refresh(payload.state_uuid, "push");
+          setStatus("");
+        } catch (err) {
+          setStatus(`Remove error: ${err.message}`);
+        }
+      });
+
+      $("chat-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (isStreaming) return;
+        const input = $("chat_input").value.trim();
+        if (!input) return;
+        $("chat_input").value = "";
+        setStatus("streaming");
+        isStreaming = true;
+        $("stop-stream").disabled = false;
+        try {
+          await streamChatRequest(input, false);
+        } catch (err) {
+          setStatus(`${err.message}`);
+        } finally {
+          isStreaming = false;
+          $("stop-stream").disabled = true;
+          renderContextSize();
+        }
+      });
+
+      $("continue-stream").addEventListener("click", async () => {
+        if (isStreaming) return;
+        setStatus("streaming");
+        isStreaming = true;
+        $("stop-stream").disabled = false;
+        try {
+          await streamChatRequest("", true);
+        } catch (err) {
+          setStatus(`${err.message}`);
+        } finally {
+          isStreaming = false;
+          $("stop-stream").disabled = true;
+          renderContextSize();
+        }
+      });
+
+      $("stop-stream").addEventListener("click", () => {
+        if (!isStreaming || !activeStreamController) {
+          return;
+        }
+        setStatus("");
+        activeStreamController.abort();
+      });
+
+      $("clear-history").addEventListener("click", async () => {
+        try {
+          const payload = await api("/api/history/clear", "POST", { state_uuid: getHashStateUUID() });
+          await refresh(payload.state_uuid, "push");
+          setStatus("");
+        } catch (err) {
+          setStatus(`Clear error: ${err.message}`);
+        }
+      });
+
+      $("nav-left").addEventListener("click", () => {
+        if (prevSiblingUUID) {
+          setHashStateUUID(prevSiblingUUID, "push");
+          refresh(prevSiblingUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
+        }
+      });
+
+      $("nav-right").addEventListener("click", () => {
+        if (nextSiblingUUID) {
+          setHashStateUUID(nextSiblingUUID, "push");
+          refresh(nextSiblingUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
+        }
+      });
+
+      $("nav-up").addEventListener("click", async () => {
+        if (!parentUUID) return;
+        const currentUUID = getHashStateUUID();
+        if (currentUUID) {
+          try {
+            await api("/api/state/visit_child", "POST", { parent: parentUUID, child: currentUUID });
+          } catch (_) {}
+        }
+        setHashStateUUID(parentUUID, "push");
+        refresh(parentUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
+      });
+
+      $("nav-down").addEventListener("click", () => {
+        if (childUUID) {
+          setHashStateUUID(childUUID, "push");
+          refresh(childUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
+        }
+      });
+
+      window.addEventListener("hashchange", () => {
+        refresh("", "none").catch((err) => setStatus(`Hash error: ${err.message}`));
+      });
+
+      window.addEventListener("popstate", () => {
+        refresh("", "none").catch((err) => setStatus(`History error: ${err.message}`));
+      });
+
+      refresh().catch((err) => setStatus(`Startup error: ${err.message}`));
+    </script>
+  </body>
+</html>
