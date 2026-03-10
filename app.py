@@ -369,11 +369,55 @@ def load_state(state_uuid: str | None = None) -> Tuple[Dict[str, Any], Dict[str,
             if idx < len(siblings) - 1:
                 next_sibling = siblings[idx + 1]
 
+    # Turn navigation: walk parent chain for prev_turn, child chain for next_turn.
+    # A "turn boundary" is a chat_progress with stage=user_message, or a "chat" action (full turn end).
+    def is_turn_boundary(ev: Dict[str, Any]) -> bool:
+        action = ev.get("action", "")
+        detail = ev.get("detail", {})
+        if action == "chat" or action == "compact":
+            return True
+        if action == "chat_progress" and detail.get("stage") == "user_message":
+            return True
+        return False
+
+    # Walk up parents to find previous turn
+    prev_turn = None
+    walk = parent_uuid
+    while walk:
+        ev = by_uuid.get(walk)
+        if not ev:
+            break
+        if is_turn_boundary(ev) and walk != current_uuid:
+            prev_turn = walk
+            break
+        walk = ev.get("parent_state_uuid")
+
+    # Walk down children to find next turn
+    next_turn = None
+    walk = preferred_child
+    while walk:
+        ev = by_uuid.get(walk)
+        if not ev:
+            break
+        if is_turn_boundary(ev):
+            next_turn = walk
+            break
+        ch = children_map.get(walk, [])
+        pref = last_child_map.get(walk)
+        if pref and pref in ch:
+            walk = pref
+        elif ch:
+            walk = ch[0]
+        else:
+            break
+
     nav = {
         "parent": parent_uuid,
         "child": preferred_child,
         "prev_sibling": prev_sibling,
         "next_sibling": next_sibling,
+        "prev_turn": prev_turn,
+        "next_turn": next_turn,
     }
 
     return normalize_state(copy.deepcopy(target["state"])), target, len(events), nav
@@ -968,6 +1012,108 @@ def build_tools_payload(
     return payload
 
 
+import re as _re
+
+_FN_CONTEXT_RE = _re.compile(r"\n@@fn_start=\d+\n.*?\n@@fn_end", _re.DOTALL)
+
+# Keys we add for UI but must strip before sending to the LLM API
+_INTERNAL_MSG_KEYS = {"_full_content"}
+
+
+def clean_messages_for_api(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a copy of messages with internal UI-only keys stripped."""
+    out = []
+    for msg in messages:
+        if _INTERNAL_MSG_KEYS & msg.keys():
+            out.append({k: v for k, v in msg.items() if k not in _INTERNAL_MSG_KEYS})
+        else:
+            out.append(msg)
+    return out
+
+
+def strip_fn_context(content: str) -> str:
+    """Strip @@fn_start...@@fn_end metadata from tool result content for model consumption."""
+    return _FN_CONTEXT_RE.sub("", content)
+
+
+def _fix_escaped_newlines(s: str) -> str:
+    r"""Replace literal \n with actual newlines, except inside Rust string literals.
+
+    Walks character by character tracking whether we're inside a "..." string.
+    Inside a Rust string, \n is kept as-is (it's a valid Rust escape).
+    Outside, it's converted to a real newline.
+    """
+    if "\\n" not in s:
+        return s
+    result = []
+    i = 0
+    in_string = False
+    while i < len(s):
+        ch = s[i]
+        if ch == '"' and (i == 0 or s[i - 1] != '\\'):
+            in_string = not in_string
+            result.append(ch)
+            i += 1
+        elif not in_string and ch == '\\' and i + 1 < len(s) and s[i + 1] == 'n':
+            result.append('\n')
+            i += 2
+        else:
+            result.append(ch)
+            i += 1
+    return ''.join(result)
+
+
+def _fix_tool_value(v: Any) -> Any:
+    """Fix a single tool argument value: unescape \\n and strip wrapping quotes."""
+    if isinstance(v, str):
+        # Strip wrapping quotes: "\"foo\"" → "foo"
+        if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+        return _fix_escaped_newlines(v)
+    if isinstance(v, list):
+        return [_fix_tool_value(item) for item in v]
+    if isinstance(v, dict):
+        return {k: _fix_tool_value(val) for k, val in v.items()}
+    return v
+
+
+def sanitize_tool_args(raw_args: str) -> Tuple[str, bool]:
+    """Clean up tool call arguments.
+
+    Returns (cleaned_args_json, is_junk).
+    - Removes keys whose values are JSON null or the strings "None"/"null".
+    - Fixes literal \\n to real newlines (except inside Rust string literals).
+    - Strips wrapping quotes from string values.
+    - is_junk=True when the cleaned args have zero remaining keys (all were null).
+    """
+    try:
+        args = json.loads(raw_args) if raw_args else {}
+    except json.JSONDecodeError:
+        return raw_args, False
+
+    if not isinstance(args, dict):
+        return raw_args, False
+
+    cleaned = {}
+    stripped = 0
+    for k, v in args.items():
+        if v is None or v == "None" or v == "null":
+            stripped += 1
+        else:
+            cleaned[k] = _fix_tool_value(v)
+
+    if stripped == 0:
+        # Still apply value fixes even if no nulls were stripped
+        fixed = {k: _fix_tool_value(v) for k, v in args.items()}
+        fixed_json = json.dumps(fixed, ensure_ascii=False)
+        if fixed_json != raw_args:
+            return fixed_json, False
+        return raw_args, False
+
+    is_junk = len(cleaned) == 0
+    return json.dumps(cleaned, ensure_ascii=False), is_junk
+
+
 def execute_tool_call(
     tool_name: str,
     raw_args: str,
@@ -1100,7 +1246,9 @@ def get_state():
             "child_state_uuid": nav["child"],
             "prev_sibling_uuid": nav["prev_sibling"],
             "next_sibling_uuid": nav["next_sibling"],
-            "context_tokens_estimate": estimate_context_tokens(state.get("history", [])),
+            "prev_turn_uuid": nav["prev_turn"],
+            "next_turn_uuid": nav["next_turn"],
+            "context_tokens_estimate": state.get("prompt_tokens") or estimate_context_tokens(state.get("history", [])),
             "state": state,
         }
     )
@@ -1381,6 +1529,7 @@ def append_history():
         state["history"].extend(normalized[1:])
     else:
         state["history"].extend(normalized)
+    state.pop("prompt_tokens", None)
     event = append_state_snapshot(state, "append_history", {"count": len(normalized), "merge_last": merge_last}, parent_state_uuid=parent_event["state_uuid"])
     return jsonify(
         {
@@ -1419,7 +1568,7 @@ def compact():
                 timeout=httpx.Timeout(None, connect=10.0),
             )
             completion_stream = client.chat.completions.create(
-                messages=messages,
+                messages=clean_messages_for_api(messages),
                 model=config["model"],
                 stream=True,
                 stream_options={"include_usage": True},
@@ -1484,6 +1633,7 @@ def compact():
                 new_history.append({"role": "system", "content": "Lookup results from prior context:\n\n" + "\n\n".join(lookup_outputs)})
             new_history.append({"role": "assistant", "content": summary})
             state["history"] = new_history
+            state.pop("prompt_tokens", None)
             event = append_state_snapshot(state, "compact", {}, parent_state_uuid=parent_event["state_uuid"])
             yield stream_line({
                 "type": "done",
@@ -1541,7 +1691,7 @@ def chat():
         client = OpenAI(base_url=config["base_url"], api_key=api_key or "EMPTY", timeout=httpx.Timeout(None, connect=10.0))
         while True:
             request_args: Dict[str, Any] = {
-                "messages": messages,
+                "messages": clean_messages_for_api(messages),
                 "model": config["model"],
             }
             if tools_payload:
@@ -1552,6 +1702,8 @@ def chat():
             content = coerce_content(message.content)
             reasoning = coerce_content(getattr(message, "reasoning_content", None))
             tool_calls = message.tool_calls or []
+            if completion.usage and completion.usage.prompt_tokens:
+                state["prompt_tokens"] = completion.usage.prompt_tokens
             runtime_ctx["response_index"] = int(runtime_ctx["response_index"]) + 1
 
             assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -1583,25 +1735,63 @@ def chat():
                 final_reply = content
                 break
 
+            # Check for null-spam tool calls and rollback if needed
+            has_junk = False
+            for tool_call in tool_calls:
+                raw_args = tool_call.function.arguments or "{}"
+                _, is_junk = sanitize_tool_args(raw_args)
+                if is_junk:
+                    has_junk = True
+                    break
+
+            if has_junk:
+                if messages and messages[-1].get("role") == "assistant":
+                    messages.pop()
+                continue  # re-prompt
+
+            tool_results_this_turn = []
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 raw_args = tool_call.function.arguments or "{}"
-                tool_result = execute_tool_call(tool_name, raw_args, tools, builtin_flags, runtime_ctx)
+                cleaned_args, _ = sanitize_tool_args(raw_args)
+                if cleaned_args != raw_args:
+                    # Update the assistant message in history
+                    if messages and messages[-1].get("role") == "assistant":
+                        for tc in messages[-1].get("tool_calls", []):
+                            if tc.get("id") == tool_call.id:
+                                tc["function"]["arguments"] = cleaned_args
 
+                tool_result = execute_tool_call(tool_name, cleaned_args, tools, builtin_flags, runtime_ctx)
+                tool_results_this_turn.append((tool_call, tool_name, cleaned_args, tool_result))
+
+            # If ALL tool results are errors, rollback and re-prompt
+            all_errors = all(
+                str(tr.get("output", "")).startswith("Error:") or str(tr.get("output", "")).startswith("ERROR:")
+                for _, _, _, tr in tool_results_this_turn
+            )
+            if all_errors and tool_results_this_turn:
+                if messages and messages[-1].get("role") == "assistant":
+                    messages.pop()
+                continue  # re-prompt without the failed tool calls
+
+            for tool_call, tool_name, cleaned_args, tool_result in tool_results_this_turn:
                 tool_trace.append(
                     {
                         "tool_name": tool_name,
-                        "arguments": raw_args,
+                        "arguments": cleaned_args,
                         "result": tool_result,
                     }
                 )
 
+                # Strip @@fn_context from model-facing content, keep full result in trace
+                model_result = {k: (strip_fn_context(v) if isinstance(v, str) else v) for k, v in tool_result.items()}
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_name,
-                        "content": json.dumps(tool_result, ensure_ascii=False),
+                        "content": json.dumps(model_result, ensure_ascii=False),
+                        "_full_content": json.dumps(tool_result, ensure_ascii=False),
                     }
                 )
 
@@ -1623,7 +1813,7 @@ def chat():
                 "reply": final_reply,
                 "history": messages,
                 "tool_trace": tool_trace,
-                "context_tokens_estimate": estimate_context_tokens(messages),
+                "context_tokens_estimate": state.get("prompt_tokens") or estimate_context_tokens(messages),
                 "state_uuid": event["state_uuid"],
                 "state_hash": event["state_hash"],
             }
@@ -1700,7 +1890,7 @@ def chat_stream():
 
             while True:
                 request_args: Dict[str, Any] = {
-                    "messages": messages,
+                    "messages": clean_messages_for_api(messages),
                     "model": config["model"],
                     "stream": True,
                     "stream_options": {"include_usage": True},
@@ -1723,6 +1913,8 @@ def chat_stream():
                             "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
                             "total_tokens": getattr(usage, "total_tokens", 0) or 0,
                         }
+                        if last_usage["prompt_tokens"]:
+                            state["prompt_tokens"] = last_usage["prompt_tokens"]
                         yield stream_line({"type": "usage", **last_usage})
                     if not chunk.choices:
                         continue
@@ -1794,31 +1986,82 @@ def chat_stream():
                     final_reply = content
                     break
 
+                # Check for null-spam tool calls and rollback if needed
+                has_junk = False
+                for tool_call in tool_calls:
+                    raw_args = tool_call["function"]["arguments"] or "{}"
+                    _, is_junk = sanitize_tool_args(raw_args)
+                    if is_junk:
+                        has_junk = True
+                        break
+
+                if has_junk:
+                    # Rollback: remove the assistant message we just appended
+                    if messages and messages[-1].get("role") == "assistant":
+                        messages.pop()
+                    yield stream_line({
+                        "type": "rollback",
+                        "reason": "Tool call had all null/None parameters — rolling back and retrying.",
+                    })
+                    continue  # re-prompt the model
+
+                # Execute all tool calls first, then check for all-error rollback
+                tool_results_this_turn = []
                 for tool_call in tool_calls:
                     tool_name = tool_call["function"]["name"]
                     raw_args = tool_call["function"]["arguments"] or "{}"
+
+                    # Sanitize: strip null/None values from args
+                    cleaned_args, _ = sanitize_tool_args(raw_args)
+                    if cleaned_args != raw_args:
+                        tool_call["function"]["arguments"] = cleaned_args
+                        # Update the assistant message in history too
+                        if messages and messages[-1].get("role") == "assistant":
+                            for tc in messages[-1].get("tool_calls", []):
+                                if tc.get("id") == tool_call["id"]:
+                                    tc["function"]["arguments"] = cleaned_args
+
+                    tool_result = execute_tool_call(tool_name, cleaned_args, tools, builtin_flags, runtime_ctx)
+                    tool_results_this_turn.append((tool_call, tool_name, cleaned_args, tool_result))
+
+                # If ALL tool results are errors, rollback and re-prompt
+                all_errors = all(
+                    str(tr.get("output", "")).startswith("Error:") or str(tr.get("output", "")).startswith("ERROR:")
+                    for _, _, _, tr in tool_results_this_turn
+                )
+                if all_errors and tool_results_this_turn:
+                    if messages and messages[-1].get("role") == "assistant":
+                        messages.pop()
+                    yield stream_line({
+                        "type": "rollback",
+                        "reason": "All tool calls returned errors — rolling back and retrying.",
+                    })
+                    continue  # re-prompt
+
+                for tool_call, tool_name, cleaned_args, tool_result in tool_results_this_turn:
                     yield stream_line(
                         {
                             "type": "tool_call",
                             "tool_name": tool_name,
-                            "arguments": raw_args,
+                            "arguments": cleaned_args,
                         }
                     )
 
-                    tool_result = execute_tool_call(tool_name, raw_args, tools, builtin_flags, runtime_ctx)
                     tool_trace.append(
                         {
                             "tool_name": tool_name,
-                            "arguments": raw_args,
+                            "arguments": cleaned_args,
                             "result": tool_result,
                         }
                     )
+                    model_result = {k: (strip_fn_context(v) if isinstance(v, str) else v) for k, v in tool_result.items()}
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call["id"],
                             "name": tool_name,
-                            "content": json.dumps(tool_result, ensure_ascii=False),
+                            "content": json.dumps(model_result, ensure_ascii=False),
+                            "_full_content": json.dumps(tool_result, ensure_ascii=False),
                         }
                     )
                     yield stream_line(
@@ -1839,6 +2082,8 @@ def chat_stream():
                     yield stream_line({"type": "snapshot", "state_uuid": ev["state_uuid"]})
 
             state["history"] = messages
+            if last_usage.get("prompt_tokens"):
+                state["prompt_tokens"] = last_usage["prompt_tokens"]
             event = append_state_snapshot(
                 state,
                 "chat",
@@ -1849,7 +2094,7 @@ def chat_stream():
                 },
                 parent_state_uuid=current_parent_uuid,
             )
-            context_tokens = last_usage.get("total_tokens") or estimate_context_tokens(messages)
+            context_tokens = last_usage.get("prompt_tokens") or estimate_context_tokens(messages)
             yield stream_line(
                 {
                     "type": "done",

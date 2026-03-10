@@ -158,6 +158,8 @@
         justify-content: center;
         opacity: 0;
         transition: opacity 0.15s;
+        user-select: none;
+        -webkit-user-select: none;
       }
       .msg:hover .msg-copy { opacity: 1; }
       .msg-copy:hover { color: #e5e7eb; background: #334155; }
@@ -203,6 +205,7 @@
       }
       .diff-del { background: #1c0a0a; border-left: 2px solid #ef4444; color: #fca5a5; }
       .diff-add { background: #0a1c0a; border-left: 2px solid #22c55e; color: #86efac; }
+      .diff-ctx { background: transparent; border-left: 2px solid #334155; color: #94a3b8; }
       .diff-section-label { font-size: 10px; color: #64748b; margin: 4px 0 1px 0; text-transform: uppercase; letter-spacing: 0.5px; }
       .msg-params { font-size: 11px; margin: 2px 0; white-space: pre-wrap; word-break: break-word; }
       .msg-raw { margin-top: 4px; }
@@ -267,6 +270,18 @@
         opacity: 0.3;
         cursor: default;
       }
+      .nav-btn-bold {
+        width: auto;
+        padding: 4px 12px;
+        font-size: 18px;
+        font-weight: bold;
+        line-height: 1;
+        background: #334155;
+        border: 1px solid #64748b;
+        border-radius: 6px;
+        color: #f8fafc;
+        cursor: pointer;
+      }
       .chat-input-bar {
         position: sticky;
         bottom: 0;
@@ -290,9 +305,11 @@
   <body>
     <div class="nav-bar">
       <button class="nav-btn" id="nav-left" type="button" disabled>&larr;</button>
+      <button class="nav-btn nav-btn-bold" id="nav-turn-up" type="button" disabled>&uArr;</button>
       <button class="nav-btn" id="nav-up" type="button" disabled>&uarr;</button>
-      <h1>Minimal Flask Tool Chat</h1>
+      <h1>Vibe Loom</h1>
       <button class="nav-btn" id="nav-down" type="button" disabled>&darr;</button>
+      <button class="nav-btn nav-btn-bold" id="nav-turn-down" type="button" disabled>&dArr;</button>
       <button class="nav-btn" id="nav-right" type="button" disabled>&rarr;</button>
     </div>
     <div class="meta" id="meta"></div>
@@ -444,11 +461,14 @@
       let cachedState = null;
       let isStreaming = false;
       let currentContextTokens = Number.NaN;
+      let contextTokensExact = false;
       let activeStreamController = null;
       let parentUUID = null;
       let childUUID = null;
       let prevSiblingUUID = null;
       let nextSiblingUUID = null;
+      let prevTurnUUID = null;
+      let nextTurnUUID = null;
 
       function setStatus(text) {
         statusEl.textContent = text;
@@ -484,12 +504,18 @@
         return `${text.slice(0, maxChars)}...`;
       }
 
+      const _fnContextRe = /\n@@fn_start=\d+\n[\s\S]*?\n@@fn_end/;
+
+      function stripFnContext(s) {
+        return typeof s === "string" ? s.replace(_fnContextRe, "") : s;
+      }
+
       function formatToolOutputValue(value) {
         if (value === null || value === undefined) {
           return "";
         }
         if (typeof value === "string") {
-          return value;
+          return stripFnContext(value);
         }
         if (typeof value === "object") {
           if (Object.prototype.hasOwnProperty.call(value, "output")) {
@@ -585,8 +611,9 @@
         const total = Number.isFinite(currentContextTokens)
           ? currentContextTokens + streamingExtraTokens
           : NaN;
+        const sep = contextTokensExact ? "=" : "~";
         const base = Number.isFinite(total)
-          ? `context_tokens~${total}`
+          ? `context_tokens${sep}${total}`
           : "context_tokens~unknown";
         $("chat-context-size").textContent = `${base}${extra}`;
       }
@@ -632,10 +659,11 @@
 
       function msgBlock(cls, label, content) {
         const escaped = escapeHtml(content);
-        return `<div class="msg ${cls}"><button class="msg-copy" onclick="copyMsg(this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${escapeHtml(label)}</div><pre class="msg-body">${escaped}</pre></div>`;
+        return `<div class="msg ${cls}"><button class="msg-copy" onmousedown="event.stopPropagation()" onclick="copyMsg(event,this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${escapeHtml(label)}</div><pre class="msg-body">${escaped}</pre></div>`;
       }
 
-      function copyMsg(btn) {
+      function copyMsg(ev, btn) {
+        ev.preventDefault();
         const pre = btn.parentElement.querySelector(".msg-body");
         if (!pre) return;
         const origHtml = btn.innerHTML;
@@ -726,7 +754,7 @@
         return { value: val, complete: false };
       }
 
-      function renderMcpRemoveView(argsStr, pending) {
+      function renderMcpRemoveView(argsStr, pending, resultText) {
         const file = extractPartialJsonString(argsStr, "file");
         const name = extractPartialJsonString(argsStr, "name");
         const usePath = extractPartialJsonString(argsStr, "use_path");
@@ -741,7 +769,17 @@
         if (name) {
           const label = name.complete ? "remove function" : "remove function (streaming)";
           html += `<div class="diff-section-label">${label}</div>`;
-          html += `<pre class="diff-del">- fn ${escapeHtml(name.value)}(...)</pre>`;
+          // If we have the result with removed source, show it
+          if (resultText) {
+            const codeMatch = resultText.match(/```\n([\s\S]*?)\n```/);
+            if (codeMatch) {
+              html += `<pre class="diff-del">${codeMatch[1].split("\n").map(l => "- " + escapeHtml(l)).join("\n")}</pre>`;
+            } else {
+              html += `<pre class="diff-del">- fn ${escapeHtml(name.value)}</pre>`;
+            }
+          } else {
+            html += `<pre class="diff-del">- fn ${escapeHtml(name.value)}${pending ? " (streaming)" : ""}</pre>`;
+          }
         } else if (usePath) {
           const label = usePath.complete ? "remove use" : "remove use (streaming)";
           html += `<div class="diff-section-label">${label}</div>`;
@@ -782,16 +820,217 @@
           html += `<div class="diff-section-label">${label}</div>`;
           html += `<pre class="diff-add">${source.value.split("\n").map(l => "+ " + escapeHtml(l)).join("\n")}</pre>`;
         } else if (name) {
-          // Structured function (no raw source) — show name while other fields stream
+          // Structured function — assemble from fields
+          const kind = extractPartialJsonString(argsStr, "kind");
+          const params = extractPartialJsonString(argsStr, "params");
+          const returnType = extractPartialJsonString(argsStr, "return_type");
+          const requires = extractPartialJsonString(argsStr, "requires");
+          const ensures = extractPartialJsonString(argsStr, "ensures");
+          const body = extractPartialJsonString(argsStr, "body");
+          const inside = extractPartialJsonString(argsStr, "inside");
+
           const label = pending ? "add function (streaming)" : "add function";
           html += `<div class="diff-section-label">${label}</div>`;
-          html += `<pre class="diff-add">+ fn ${escapeHtml(name.value)}(...)</pre>`;
+          if (inside) {
+            html += `<div class="diff-section-label" style="font-size:0.8em;opacity:0.7">inside ${escapeHtml(inside.value)}</div>`;
+          }
+
+          // Build function lines
+          let lines = [];
+          const kindStr = kind ? kind.value + " " : "";
+          const paramsStr = params ? params.value : "";
+          const retStr = returnType ? " -> " + returnType.value : "";
+          lines.push(`${kindStr}fn ${name.value}${paramsStr}${retStr}`);
+
+          if (requires) {
+            lines.push("    requires");
+            try {
+              const arr = JSON.parse(requires.value);
+              if (Array.isArray(arr)) arr.forEach(r => lines.push("        " + r + ","));
+              else lines.push("        " + requires.value);
+            } catch(_) { lines.push("        " + requires.value); }
+          }
+          if (ensures) {
+            lines.push("    ensures");
+            try {
+              const arr = JSON.parse(ensures.value);
+              if (Array.isArray(arr)) arr.forEach(e => lines.push("        " + e + ","));
+              else lines.push("        " + ensures.value);
+            } catch(_) { lines.push("        " + ensures.value); }
+          }
+          if (body) {
+            body.value.split("\n").forEach(l => lines.push(l));
+          } else if (!pending) {
+            lines.push("{ }");
+          }
+
+          html += `<pre class="diff-add">${lines.map(l => "+ " + escapeHtml(l)).join("\n")}</pre>`;
         }
         html += '</div>';
         return html;
       }
 
-      function renderMcpEditDiff(argsStr, pending) {
+      // Simple line-level diff using LCS (longest common subsequence)
+      function lineDiff(oldLines, newLines) {
+        const m = oldLines.length, n = newLines.length;
+        // Build LCS table
+        const dp = Array.from({length: m + 1}, () => new Uint16Array(n + 1));
+        for (let i = 1; i <= m; i++) {
+          for (let j = 1; j <= n; j++) {
+            dp[i][j] = oldLines[i-1] === newLines[j-1]
+              ? dp[i-1][j-1] + 1
+              : Math.max(dp[i-1][j], dp[i][j-1]);
+          }
+        }
+        // Backtrack to produce diff entries
+        const result = [];
+        let i = m, j = n;
+        while (i > 0 || j > 0) {
+          if (i > 0 && j > 0 && oldLines[i-1] === newLines[j-1]) {
+            result.push({type: "ctx", text: oldLines[i-1]});
+            i--; j--;
+          } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
+            result.push({type: "add", text: newLines[j-1]});
+            j--;
+          } else {
+            result.push({type: "del", text: oldLines[i-1]});
+            i--;
+          }
+        }
+        result.reverse();
+        return result;
+      }
+
+      function renderUnifiedDiff(oldText, newText) {
+        const oldLines = oldText.split("\n");
+        const newLines = newText.split("\n");
+        const diff = lineDiff(oldLines, newLines);
+        return diff.map(d => {
+          const prefix = d.type === "del" ? "- " : d.type === "add" ? "+ " : "  ";
+          const cls = d.type === "del" ? "diff-del" : d.type === "add" ? "diff-add" : "diff-ctx";
+          return `<span class="${cls}">${prefix}${escapeHtml(d.text)}</span>`;
+        }).join("\n");
+      }
+
+      // Parse @@fn_start=N ... @@fn_end from tool result text
+      function parseFnContext(resultText) {
+        if (!resultText) return null;
+        const m = resultText.match(/@@fn_start=(\d+)\n([\s\S]*?)\n@@fn_end/);
+        if (!m) return null;
+        return { startLine: parseInt(m[1], 10), source: m[2] };
+      }
+
+      // Render function-scoped diff with line numbers
+      function renderFnScopedDiff(fnSource, fnStartLine, oldString, newString) {
+        // Reconstruct "before" function by replacing new_string → old_string
+        const beforeFn = fnSource.replace(newString, oldString);
+        const afterLines = fnSource.split("\n");
+        const beforeLines = beforeFn.split("\n");
+        const totalLines = afterLines.length;
+
+        const diff = lineDiff(beforeLines, afterLines);
+
+        // If function > 100 lines, show header ... changed region ... closing brace
+        if (totalLines > 100) {
+          // Find first and last changed line indices in the diff
+          let firstChange = -1, lastChange = -1;
+          for (let i = 0; i < diff.length; i++) {
+            if (diff[i].type !== "ctx") {
+              if (firstChange === -1) firstChange = i;
+              lastChange = i;
+            }
+          }
+          if (firstChange === -1) {
+            // No changes found — just show context
+            return `<pre class="diff-ctx">${afterLines.map((l, i) => `<span class="diff-ctx">${String(fnStartLine + i).padStart(4)}   ${escapeHtml(l)}</span>`).join("\n")}</pre>`;
+          }
+
+          // Show: first line (signature), ..., 3 context before change, changes, 3 context after, ..., last line
+          const contextPad = 3;
+          const showStart = Math.max(1, firstChange - contextPad);
+          const showEnd = Math.min(diff.length - 2, lastChange + contextPad);
+
+          let lines = [];
+          let lineNo = fnStartLine;
+
+          // First line (function signature)
+          lines.push(`<span class="diff-ctx">${String(lineNo).padStart(4)}   ${escapeHtml(diff[0].text)}</span>`);
+          lineNo += 1;
+
+          // ... gap
+          if (showStart > 1) {
+            lines.push(`<span class="diff-ctx">        ...</span>`);
+            lineNo = fnStartLine + showStart; // approximate
+          }
+
+          // Track line number through diff entries
+          let curLine = fnStartLine;
+          for (let i = 0; i < diff.length; i++) {
+            if (diff[i].type !== "del") curLine++;
+          }
+          // Re-walk with proper line tracking
+          lines = [];
+          let fileLineNo = fnStartLine;
+          let inRange = false;
+          let beforeRange = true;
+          let signatureDone = false;
+
+          for (let i = 0; i < diff.length; i++) {
+            const d = diff[i];
+            const isChanged = d.type !== "ctx";
+            const nearChange = (i >= firstChange - contextPad && i <= lastChange + contextPad);
+
+            if (!signatureDone) {
+              // Always show first line
+              const ln = d.type === "del" ? "    " : String(fileLineNo).padStart(4);
+              lines.push(`<span class="diff-ctx">${ln}   ${escapeHtml(d.text)}</span>`);
+              signatureDone = true;
+              if (d.type !== "del") fileLineNo++;
+              continue;
+            }
+
+            if (nearChange && beforeRange) {
+              lines.push(`<span class="diff-ctx">        ...</span>`);
+              beforeRange = false;
+              inRange = true;
+            }
+
+            if (inRange && nearChange) {
+              const prefix = d.type === "del" ? "- " : d.type === "add" ? "+ " : "  ";
+              const cls = d.type === "del" ? "diff-del" : d.type === "add" ? "diff-add" : "diff-ctx";
+              const ln = d.type === "del" ? "    " : String(fileLineNo).padStart(4);
+              lines.push(`<span class="${cls}">${ln} ${prefix}${escapeHtml(d.text)}</span>`);
+            }
+
+            if (inRange && !nearChange && i > lastChange + contextPad) {
+              inRange = false;
+            }
+
+            if (d.type !== "del") fileLineNo++;
+          }
+
+          // ... gap + closing brace
+          lines.push(`<span class="diff-ctx">        ...</span>`);
+          const lastAfterLine = afterLines[afterLines.length - 1];
+          lines.push(`<span class="diff-ctx">${String(fnStartLine + afterLines.length - 1).padStart(4)}   ${escapeHtml(lastAfterLine)}</span>`);
+
+          return `<pre style="margin:0;padding:4px 8px;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto">${lines.join("\n")}</pre>`;
+        }
+
+        // Short function (≤100 lines) — show full function with diff coloring and line numbers
+        let resultLines = [];
+        let fileLineNo = fnStartLine;
+        for (const d of diff) {
+          const prefix = d.type === "del" ? "- " : d.type === "add" ? "+ " : "  ";
+          const cls = d.type === "del" ? "diff-del" : d.type === "add" ? "diff-add" : "diff-ctx";
+          const ln = d.type === "del" ? "    " : String(fileLineNo).padStart(4);
+          resultLines.push(`<span class="${cls}">${ln} ${prefix}${escapeHtml(d.text)}</span>`);
+          if (d.type !== "del") fileLineNo++;
+        }
+        return `<pre style="margin:0;padding:4px 8px;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto">${resultLines.join("\n")}</pre>`;
+      }
+
+      function renderMcpEditDiff(argsStr, pending, resultText) {
         const file = extractPartialJsonString(argsStr, "file");
         const name = extractPartialJsonString(argsStr, "name");
         const oldStr = extractPartialJsonString(argsStr, "old_string");
@@ -807,17 +1046,31 @@
           const header = [filePart, namePart].filter(Boolean).join(" :: ");
           html += `<div class="diff-file">${header}</div>`;
         }
-        if (oldStr) {
-          const label = oldStr.complete ? "replace" : "replace (streaming)";
-          html += `<div class="diff-section-label">${label}</div>`;
-          html += `<pre class="diff-del">${oldStr.value.split("\n").map(l => "- " + escapeHtml(l)).join("\n")}</pre>`;
-        }
-        if (newStr) {
-          const label = newStr.complete ? "with" : "with (streaming)";
-          html += `<div class="diff-section-label">${label}</div>`;
-          html += `<pre class="diff-add">${newStr.value.split("\n").map(l => "+ " + escapeHtml(l)).join("\n")}</pre>`;
-        } else if (oldStr && oldStr.complete) {
-          html += `<div class="diff-section-label">with (waiting...)</div>`;
+
+        const complete = oldStr && oldStr.complete && newStr && newStr.complete;
+        if (complete) {
+          // Try to use function context from result
+          const fnCtx = parseFnContext(resultText);
+          if (fnCtx) {
+            html += renderFnScopedDiff(fnCtx.source, fnCtx.startLine, oldStr.value, newStr.value);
+          } else {
+            // Fallback: plain unified diff
+            html += `<pre style="margin:0;padding:4px 8px;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto">${renderUnifiedDiff(oldStr.value, newStr.value)}</pre>`;
+          }
+        } else {
+          // Still streaming — show old/new blocks separately
+          if (oldStr) {
+            const label = oldStr.complete ? "replace" : "replace (streaming)";
+            html += `<div class="diff-section-label">${label}</div>`;
+            html += `<pre class="diff-del">${oldStr.value.split("\n").map(l => "- " + escapeHtml(l)).join("\n")}</pre>`;
+          }
+          if (newStr) {
+            const label = newStr.complete ? "with" : "with (streaming)";
+            html += `<div class="diff-section-label">${label}</div>`;
+            html += `<pre class="diff-add">${newStr.value.split("\n").map(l => "+ " + escapeHtml(l)).join("\n")}</pre>`;
+          } else if (oldStr && oldStr.complete) {
+            html += `<div class="diff-section-label">with (waiting...)</div>`;
+          }
         }
         html += '</div>';
         return html;
@@ -838,24 +1091,30 @@
           const pathLabel = escapeHtml(path.value) + (create ? " (new file)" : (startLine ? ":" + sl : ""));
           html += `<div class="diff-file">${pathLabel}</div>`;
         }
-        if (oldStr && !create) {
-          const label = oldStr.complete ? "replace" : "replace (streaming)";
-          html += `<div class="diff-section-label">${label}</div>`;
-          html += `<pre class="diff-del">${numberedLines(oldStr.value, sl, "-")}</pre>`;
-        }
-        if (newStr) {
-          const label = newStr.complete ? (create ? "content" : "with") : (create ? "content (streaming)" : "with (streaming)");
-          html += `<div class="diff-section-label">${label}</div>`;
-          html += `<pre class="diff-add">${numberedLines(newStr.value, sl, "+")}</pre>`;
-        } else if (oldStr && oldStr.complete && !create) {
-          // old_string is done but new_string hasn't started yet
-          html += `<div class="diff-section-label">with (waiting...)</div>`;
+
+        const complete = oldStr && oldStr.complete && newStr && newStr.complete && !create;
+        if (complete) {
+          // Finished — show unified diff
+          html += `<pre style="margin:0;padding:4px 8px;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto">${renderUnifiedDiff(oldStr.value, newStr.value)}</pre>`;
+        } else {
+          if (oldStr && !create) {
+            const label = oldStr.complete ? "replace" : "replace (streaming)";
+            html += `<div class="diff-section-label">${label}</div>`;
+            html += `<pre class="diff-del">${numberedLines(oldStr.value, sl, "-")}</pre>`;
+          }
+          if (newStr) {
+            const label = newStr.complete ? (create ? "content" : "with") : (create ? "content (streaming)" : "with (streaming)");
+            html += `<div class="diff-section-label">${label}</div>`;
+            html += `<pre class="diff-add">${numberedLines(newStr.value, sl, "+")}</pre>`;
+          } else if (oldStr && oldStr.complete && !create) {
+            html += `<div class="diff-section-label">with (waiting...)</div>`;
+          }
         }
         html += '</div>';
         return html;
       }
 
-      function renderToolCallHtml(toolName, argsStr, pending, startLine) {
+      function renderToolCallHtml(toolName, argsStr, pending, startLine, resultText, resultRaw) {
         const eName = escapeHtml(toolName);
         const label = pending ? `calling ${eName}...` : `call ${eName}`;
         let bodyHtml = "";
@@ -863,13 +1122,13 @@
           const diffHtml = renderFileEditDiff(argsStr, pending, startLine);
           if (diffHtml) bodyHtml = diffHtml;
         } else if (toolName === "edit") {
-          const diffHtml = renderMcpEditDiff(argsStr, pending);
+          const diffHtml = renderMcpEditDiff(argsStr, pending, resultRaw || resultText);
           if (diffHtml) bodyHtml = diffHtml;
         } else if (toolName === "add") {
           const diffHtml = renderMcpAddView(argsStr, pending);
           if (diffHtml) bodyHtml = diffHtml;
         } else if (toolName === "remove") {
-          const diffHtml = renderMcpRemoveView(argsStr, pending);
+          const diffHtml = renderMcpRemoveView(argsStr, pending, resultText);
           if (diffHtml) bodyHtml = diffHtml;
         } else if (!pending) {
           const pretty = prettyParams(argsStr);
@@ -878,7 +1137,7 @@
           }
         }
         const rawDetails = `<details class="msg-raw"><summary>json</summary><pre class="msg-body">${escapeHtml(argsStr)}</pre></details>`;
-        return `<div class="msg msg-tool-call"><button class="msg-copy" onclick="copyMsg(this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${label}</div>${bodyHtml}${rawDetails}</div>`;
+        return `<div class="msg msg-tool-call"><button class="msg-copy" onmousedown="event.stopPropagation()" onclick="copyMsg(event,this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${label}</div>${bodyHtml}${rawDetails}</div>`;
       }
 
       function extractStartLine(content) {
@@ -892,13 +1151,20 @@
       function historyToBlocks(history) {
         if (!history || history.length === 0) return [];
         const blocks = [];
-        // Build maps from tool_call_id to start_line and to tool call info
+        // Build maps from tool_call_id to start_line, tool call info, and result text
         const startLineMap = {};
         const toolCallMap = {};
+        const toolResultMap = {};
+        const toolResultRawMap = {};
         history.forEach((msg) => {
           if (msg.role === "tool" && msg.tool_call_id) {
             const sl = extractStartLine(msg.content);
             if (sl != null) startLineMap[msg.tool_call_id] = sl;
+            // Use _full_content (has fn context metadata) if available, else content
+            const fullContent = msg._full_content || msg.content;
+            // formatToolOutput strips @@fn_context for display; keep raw for diff parsing
+            toolResultMap[msg.tool_call_id] = formatToolOutput(fullContent);
+            toolResultRawMap[msg.tool_call_id] = typeof fullContent === "string" ? fullContent : JSON.stringify(fullContent);
           }
           if (msg.tool_calls) {
             msg.tool_calls.forEach((tc) => {
@@ -917,7 +1183,7 @@
             const text = formatToolOutput(msg.content);
             const tc = msg.tool_call_id ? toolCallMap[msg.tool_call_id] : null;
             if (tc && tc.name === "read_file" && typeof tc.args.path === "string" && tc.args.path.endsWith(".rs")) {
-              const html = `<div class="msg msg-tool"><button class="msg-copy" onclick="copyMsg(this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${escapeHtml("tool")}</div><pre class="msg-body">${highlightRustOutput(text)}</pre></div>`;
+              const html = `<div class="msg msg-tool"><button class="msg-copy" onmousedown="event.stopPropagation()" onclick="copyMsg(event,this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${escapeHtml("tool")}</div><pre class="msg-body">${highlightRustOutput(text)}</pre></div>`;
               blocks.push(html);
             } else {
               blocks.push(msgBlock("msg-tool", "tool", text));
@@ -929,11 +1195,20 @@
             blocks.push(msgBlock("msg-thinking", "thinking", rc));
           }
           const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-          blocks.push(msgBlock(`msg-${msg.role}`, msg.role, content));
+          if (msg.role === "assistant" && msg.tool_calls) {
+            // Show assistant text + raw response toggle
+            const rawJson = JSON.stringify(msg, null, 2);
+            const rawDetails = `<details class="msg-raw"><summary>raw response</summary><pre class="msg-body">${escapeHtml(rawJson)}</pre></details>`;
+            blocks.push(`<div class="msg msg-assistant"><button class="msg-copy" onmousedown="event.stopPropagation()" onclick="copyMsg(event,this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">assistant</div><pre class="msg-body">${escapeHtml(content)}</pre>${rawDetails}</div>`);
+          } else {
+            blocks.push(msgBlock(`msg-${msg.role}`, msg.role, content));
+          }
           if (msg.tool_calls) {
             msg.tool_calls.forEach((tc) => {
               const sl = tc.id ? startLineMap[tc.id] : null;
-              blocks.push(renderToolCallHtml(tc.function.name, tc.function.arguments || "{}", false, sl));
+              const rt = tc.id ? toolResultMap[tc.id] : null;
+              const rtRaw = tc.id ? toolResultRawMap[tc.id] : null;
+              blocks.push(renderToolCallHtml(tc.function.name, tc.function.arguments || "{}", false, sl, rt, rtRaw));
             });
           }
         });
@@ -1281,6 +1556,7 @@
           let liveCommitted = 0;
           let liveFirstAssistant = true; // tracks mergePrefix across entries
           let streamPhase = "processing input";
+          let rawEventLog = []; // collect all SSE events for raw view
           setStatus("processing input...");
 
           function liveEntryHtml(entry) {
@@ -1291,7 +1567,7 @@
               // Don't advance liveFirstAssistant here — caller decides when to freeze
               return msgBlock("msg-assistant", "assistant", prefix + (entry.text || "..."));
             } else if (entry.type === "tool_call") {
-              return renderToolCallHtml(entry.tool_name, entry.arguments || "{}", !!entry.pending, entry.startLine);
+              return renderToolCallHtml(entry.tool_name, entry.arguments || "{}", !!entry.pending, entry.startLine, entry.resultText, entry.resultRaw);
             } else if (entry.type === "tool_result") {
               return msgBlock("msg-tool", "tool", entry.output || "");
             }
@@ -1337,11 +1613,27 @@
             }
             tail.innerHTML = liveEntryHtml(tailEntry);
 
+            // Update raw event log viewer
+            if (rawEventLog.length > 0) {
+              let rawEl = liveEl.querySelector(".live-raw-log");
+              if (!rawEl) {
+                rawEl = document.createElement("div");
+                rawEl.className = "live-raw-log";
+                liveEl.appendChild(rawEl);
+              }
+              const rawJson = rawEventLog.map(e => JSON.stringify(e, null, 2)).join("\n---\n");
+              rawEl.innerHTML = `<details class="msg-raw"><summary>raw events (${rawEventLog.length})</summary><pre class="msg-body" style="max-height:400px">${escapeHtml(rawJson)}</pre></details>`;
+            }
+
             if (wasNearBottom) $("chat-log").scrollTop = $("chat-log").scrollHeight;
           };
 
           const handleEvent = async (evt) => {
             if (!evt || typeof evt !== "object") return false;
+            // Log tool-related events for raw view (skip noisy text deltas)
+            if (evt.type === "tool_call_start" || evt.type === "tool_call" || evt.type === "tool_result") {
+              rawEventLog.push(evt);
+            }
             if (evt.type === "snapshot") {
               setHashStateUUID(evt.state_uuid, "replace");
               return false;
@@ -1427,17 +1719,19 @@
               streamingExtraTokens += roughTokenCount(rawResult) + 4;
               // Extract start_line and attach to the most recent file_edit tool call
               const sl = extractStartLine(evt.result);
-              if (sl != null) {
-                const tcEntry = liveTimeline.findLast(e => e.type === "tool_call" && e.tool_name === "file_edit");
-                if (tcEntry) {
-                  tcEntry.startLine = sl;
-                  // If that tool_call is already committed, update its DOM in place
-                  const tcIdx = liveTimeline.lastIndexOf(tcEntry);
-                  if (tcIdx < liveCommitted) {
-                    const committedDivs = $("chat-log-live").querySelectorAll(".live-committed");
-                    if (committedDivs[tcIdx]) {
-                      committedDivs[tcIdx].innerHTML = liveEntryHtml(tcEntry);
-                    }
+              // Attach result text to matching tool_call for diff rendering
+              const matchingTc = liveTimeline.findLast(e => e.type === "tool_call" && e.tool_name === evt.tool_name);
+              if (matchingTc) {
+                matchingTc.resultText = output;
+                matchingTc.resultRaw = rawResult;
+                matchingTc.pending = false;
+                if (sl != null) matchingTc.startLine = sl;
+                // If already committed, update DOM in place
+                const tcIdx = liveTimeline.lastIndexOf(matchingTc);
+                if (tcIdx < liveCommitted) {
+                  const committedDivs = $("chat-log-live").querySelectorAll(".live-committed");
+                  if (committedDivs[tcIdx]) {
+                    committedDivs[tcIdx].innerHTML = liveEntryHtml(matchingTc);
                   }
                 }
               }
@@ -1449,9 +1743,31 @@
               renderContextSize(" (streaming)");
               return false;
             }
+            if (evt.type === "rollback") {
+              // Server rolled back a junk tool call — clear the pending tool calls from timeline
+              streamPhase = "processing input";
+              setStatus("rollback: " + (evt.reason || "retrying..."));
+              // Remove the last pending tool_call entries from timeline
+              while (liveTimeline.length > 0 && liveTimeline[liveTimeline.length - 1].type === "tool_call") {
+                liveTimeline.pop();
+              }
+              // Remove the last assistant entry too (it was the one with junk calls)
+              while (liveTimeline.length > 0 && liveTimeline[liveTimeline.length - 1].type === "assistant") {
+                liveTimeline.pop();
+              }
+              // Reset committed count if needed
+              liveCommitted = Math.min(liveCommitted, liveTimeline.length);
+              // Rebuild the live DOM
+              const liveEl = $("chat-log-live");
+              liveEl.innerHTML = "";
+              liveCommitted = 0;
+              renderLive();
+              return false;
+            }
             if (evt.type === "usage") {
               // Real token counts from the API — replace estimates
-              currentContextTokens = evt.total_tokens;
+              currentContextTokens = evt.prompt_tokens || evt.total_tokens;
+              contextTokensExact = true;
               streamingExtraTokens = 0;
               // Usage comes at end of a completion — next event is either done or a new round
               streamPhase = "processing input";
@@ -1540,13 +1856,18 @@
         childUUID = payload.child_state_uuid || null;
         prevSiblingUUID = payload.prev_sibling_uuid || null;
         nextSiblingUUID = payload.next_sibling_uuid || null;
+        prevTurnUUID = payload.prev_turn_uuid || null;
+        nextTurnUUID = payload.next_turn_uuid || null;
         $("nav-left").disabled = !prevSiblingUUID;
         $("nav-up").disabled = !parentUUID;
         $("nav-down").disabled = !childUUID;
         $("nav-right").disabled = !nextSiblingUUID;
+        $("nav-turn-up").disabled = !prevTurnUUID;
+        $("nav-turn-down").disabled = !nextTurnUUID;
         setHashStateUUID(payload.state_uuid, historyMode);
         renderMeta(payload);
         currentContextTokens = Number(payload.context_tokens_estimate);
+        contextTokensExact = !!(cachedState.prompt_tokens);
         renderContextSize();
         renderToolList(cachedState.tools, cachedState.config.builtin_tools || {});
         renderChat(cachedState.history);
@@ -1773,7 +2094,8 @@
               html += msgBlock("msg-system", "compact summary", summaryText);
               setChatLogHtml(html);
             } else if (evt.type === "usage") {
-              currentContextTokens = evt.total_tokens;
+              currentContextTokens = evt.prompt_tokens || evt.total_tokens;
+              contextTokensExact = !!evt.prompt_tokens;
               streamingExtraTokens = 0;
               renderContextSize(" (compacting)");
             } else if (evt.type === "done") {
@@ -1882,6 +2204,20 @@
         if (childUUID) {
           setHashStateUUID(childUUID, "push");
           refresh(childUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
+        }
+      });
+
+      $("nav-turn-up").addEventListener("click", () => {
+        if (prevTurnUUID) {
+          setHashStateUUID(prevTurnUUID, "push");
+          refresh(prevTurnUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
+        }
+      });
+
+      $("nav-turn-down").addEventListener("click", () => {
+        if (nextTurnUUID) {
+          setHashStateUUID(nextTurnUUID, "push");
+          refresh(nextTurnUUID, "none").catch((err) => setStatus(`Nav error: ${err.message}`));
         }
       });
 
