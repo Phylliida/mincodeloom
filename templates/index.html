@@ -726,6 +726,103 @@
         return { value: val, complete: false };
       }
 
+      function renderMcpRemoveView(argsStr, pending) {
+        const file = extractPartialJsonString(argsStr, "file");
+        const name = extractPartialJsonString(argsStr, "name");
+        const usePath = extractPartialJsonString(argsStr, "use_path");
+        const modName = extractPartialJsonString(argsStr, "mod_name");
+
+        if (!name && !usePath && !modName) return null;
+
+        let html = '<div class="msg-diff">';
+        if (file) {
+          html += `<div class="diff-file">${escapeHtml(file.value)}</div>`;
+        }
+        if (name) {
+          const label = name.complete ? "remove function" : "remove function (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-del">- fn ${escapeHtml(name.value)}(...)</pre>`;
+        } else if (usePath) {
+          const label = usePath.complete ? "remove use" : "remove use (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-del">- use ...${escapeHtml(usePath.value)}...;</pre>`;
+        } else if (modName) {
+          const label = modName.complete ? "remove mod" : "remove mod (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-del">- pub mod ${escapeHtml(modName.value)};</pre>`;
+        }
+        html += '</div>';
+        return html;
+      }
+
+      function renderMcpAddView(argsStr, pending) {
+        const file = extractPartialJsonString(argsStr, "file");
+        const usePath = extractPartialJsonString(argsStr, "use_path");
+        const modName = extractPartialJsonString(argsStr, "mod_name");
+        const source = extractPartialJsonString(argsStr, "source");
+        const name = extractPartialJsonString(argsStr, "name");
+
+        // Need at least one content field to render
+        if (!usePath && !modName && !source && !name) return null;
+
+        let html = '<div class="msg-diff">';
+        if (file) {
+          html += `<div class="diff-file">${escapeHtml(file.value)}</div>`;
+        }
+        if (usePath) {
+          const label = usePath.complete ? "add use" : "add use (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-add">+ use ${escapeHtml(usePath.value)};</pre>`;
+        } else if (modName) {
+          const label = modName.complete ? "add mod" : "add mod (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-add">+ pub mod ${escapeHtml(modName.value)};</pre>`;
+        } else if (source) {
+          const label = source.complete ? "add function" : "add function (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-add">${source.value.split("\n").map(l => "+ " + escapeHtml(l)).join("\n")}</pre>`;
+        } else if (name) {
+          // Structured function (no raw source) — show name while other fields stream
+          const label = pending ? "add function (streaming)" : "add function";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-add">+ fn ${escapeHtml(name.value)}(...)</pre>`;
+        }
+        html += '</div>';
+        return html;
+      }
+
+      function renderMcpEditDiff(argsStr, pending) {
+        const file = extractPartialJsonString(argsStr, "file");
+        const name = extractPartialJsonString(argsStr, "name");
+        const oldStr = extractPartialJsonString(argsStr, "old_string");
+        const newStr = extractPartialJsonString(argsStr, "new_string");
+
+        if (!oldStr && !newStr) return null;
+
+        let html = '<div class="msg-diff">';
+        // Header: file :: function
+        const filePart = file ? escapeHtml(file.value) : "";
+        const namePart = name ? escapeHtml(name.value) : "";
+        if (filePart || namePart) {
+          const header = [filePart, namePart].filter(Boolean).join(" :: ");
+          html += `<div class="diff-file">${header}</div>`;
+        }
+        if (oldStr) {
+          const label = oldStr.complete ? "replace" : "replace (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-del">${oldStr.value.split("\n").map(l => "- " + escapeHtml(l)).join("\n")}</pre>`;
+        }
+        if (newStr) {
+          const label = newStr.complete ? "with" : "with (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-add">${newStr.value.split("\n").map(l => "+ " + escapeHtml(l)).join("\n")}</pre>`;
+        } else if (oldStr && oldStr.complete) {
+          html += `<div class="diff-section-label">with (waiting...)</div>`;
+        }
+        html += '</div>';
+        return html;
+      }
+
       function renderFileEditDiff(argsStr, pending, startLine) {
         const path = extractPartialJsonString(argsStr, "path");
         const oldStr = extractPartialJsonString(argsStr, "old_string");
@@ -764,6 +861,15 @@
         let bodyHtml = "";
         if (toolName === "file_edit") {
           const diffHtml = renderFileEditDiff(argsStr, pending, startLine);
+          if (diffHtml) bodyHtml = diffHtml;
+        } else if (toolName === "edit") {
+          const diffHtml = renderMcpEditDiff(argsStr, pending);
+          if (diffHtml) bodyHtml = diffHtml;
+        } else if (toolName === "add") {
+          const diffHtml = renderMcpAddView(argsStr, pending);
+          if (diffHtml) bodyHtml = diffHtml;
+        } else if (toolName === "remove") {
+          const diffHtml = renderMcpRemoveView(argsStr, pending);
           if (diffHtml) bodyHtml = diffHtml;
         } else if (!pending) {
           const pretty = prettyParams(argsStr);

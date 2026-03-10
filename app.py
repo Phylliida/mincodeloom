@@ -167,7 +167,10 @@ def read_all_events() -> List[Dict[str, Any]]:
         for line in handle:
             line = line.strip()
             if line:
-                events.append(json.loads(line))
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
     return events
 
 
