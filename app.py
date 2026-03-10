@@ -99,7 +99,7 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         },
     },
     "read_file": {
-        "description": "Read a file's contents with line numbers. Optionally specify a line range.",
+        "description": "Read a file's contents with line numbers. Optionally specify a line range. Prefer lookup_source to save context.",
         "parameters": {
             "type": "object",
             "required": ["path"],
@@ -1448,46 +1448,39 @@ def compact():
 
             summary = "".join(content_parts)
 
-            # Preserve lookup tool calls and their results, trimmed to ~15000 tokens
-            lookup_messages: List[Dict[str, Any]] = []
+            # Collect lookup tool result outputs into one system message
             lookup_tc_ids: set = set()
-            # First pass: find assistant messages with lookup tool calls
             for msg in history:
                 if msg.get("role") == "assistant" and msg.get("tool_calls"):
                     for tc in msg["tool_calls"]:
                         fn = tc.get("function", {})
                         if fn.get("name") == "lookup":
                             lookup_tc_ids.add(tc.get("id"))
-            # Second pass: collect the assistant messages (with only lookup tool_calls)
-            # and matching tool result messages, in order
+            lookup_outputs: List[str] = []
             for msg in history:
-                if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    lookup_tcs = [tc for tc in msg["tool_calls"] if tc.get("id") in lookup_tc_ids]
-                    if lookup_tcs:
-                        trimmed = copy.deepcopy(msg)
-                        trimmed["tool_calls"] = lookup_tcs
-                        trimmed["content"] = ""
-                        lookup_messages.append(trimmed)
-                elif msg.get("role") == "tool" and msg.get("tool_call_id") in lookup_tc_ids:
-                    lookup_messages.append(copy.deepcopy(msg))
+                if msg.get("role") == "tool" and msg.get("tool_call_id") in lookup_tc_ids:
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        try:
+                            parsed = json.loads(content)
+                            text = parsed.get("output", content) if isinstance(parsed, dict) else content
+                        except (json.JSONDecodeError, TypeError):
+                            text = content
+                    else:
+                        text = coerce_content(content)
+                    if text.strip():
+                        lookup_outputs.append(text.strip())
 
             # Trim from the front to fit within ~15000 tokens
             max_lookup_tokens = 15000
-            while lookup_messages and estimate_context_tokens(lookup_messages) > max_lookup_tokens:
-                removed = lookup_messages.pop(0)
-                # Also remove orphaned tool results or assistant messages
-                if removed.get("role") == "assistant" and removed.get("tool_calls"):
-                    orphan_ids = {tc.get("id") for tc in removed.get("tool_calls", [])}
-                    lookup_messages = [m for m in lookup_messages if m.get("tool_call_id") not in orphan_ids]
-                elif removed.get("role") == "tool":
-                    # Remove assistant message if it has no remaining tool results
-                    tc_id = removed.get("tool_call_id")
-                    if tc_id:
-                        for m in lookup_messages:
-                            if m.get("role") == "assistant" and m.get("tool_calls"):
-                                m["tool_calls"] = [tc for tc in m["tool_calls"] if tc.get("id") != tc_id]
+            while lookup_outputs and rough_token_count_text("\n\n".join(lookup_outputs)) > max_lookup_tokens:
+                lookup_outputs.pop(0)
 
-            state["history"] = lookup_messages + [{"role": "assistant", "content": summary}]
+            new_history: List[Dict[str, Any]] = []
+            if lookup_outputs:
+                new_history.append({"role": "system", "content": "Lookup results from prior context:\n\n" + "\n\n".join(lookup_outputs)})
+            new_history.append({"role": "assistant", "content": summary})
+            state["history"] = new_history
             event = append_state_snapshot(state, "compact", {}, parent_state_uuid=parent_event["state_uuid"])
             yield stream_line({
                 "type": "done",
