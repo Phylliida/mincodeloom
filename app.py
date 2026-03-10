@@ -1779,6 +1779,14 @@ def chat_stream():
                 else:
                     messages.append(assistant_message)
 
+                # Save after each assistant response finishes streaming
+                ev = save_progress({
+                    "prompt": prompt,
+                    "stage": "assistant_response",
+                    "has_tool_calls": bool(tool_calls),
+                })
+                yield stream_line({"type": "snapshot", "state_uuid": ev["state_uuid"]})
+
                 if not tool_calls:
                     final_reply = content
                     break
@@ -1818,13 +1826,14 @@ def chat_stream():
                         }
                     )
 
-                # Save progress after each tool-use round
-                ev = save_progress({
-                    "prompt": prompt,
-                    "stage": "tool_round",
-                    "tool_calls_executed": len(tool_trace),
-                })
-                yield stream_line({"type": "snapshot", "state_uuid": ev["state_uuid"]})
+                    # Save after each tool call + result
+                    ev = save_progress({
+                        "prompt": prompt,
+                        "stage": "tool_result",
+                        "tool_name": tool_name,
+                        "tool_calls_executed": len(tool_trace),
+                    })
+                    yield stream_line({"type": "snapshot", "state_uuid": ev["state_uuid"]})
 
             state["history"] = messages
             event = append_state_snapshot(

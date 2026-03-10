@@ -139,7 +139,28 @@
         border-radius: 4px;
         margin: 3px 0;
         padding: 4px 8px;
+        position: relative;
       }
+      .msg-copy {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 4px;
+        color: #94a3b8;
+        cursor: pointer;
+        width: 24px;
+        height: 24px;
+        padding: 3px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0;
+        transition: opacity 0.15s;
+      }
+      .msg:hover .msg-copy { opacity: 1; }
+      .msg-copy:hover { color: #e5e7eb; background: #334155; }
       .msg-label {
         font-size: 10px;
         color: #64748b;
@@ -182,6 +203,7 @@
       }
       .diff-del { background: #1c0a0a; border-left: 2px solid #ef4444; color: #fca5a5; }
       .diff-add { background: #0a1c0a; border-left: 2px solid #22c55e; color: #86efac; }
+      .diff-section-label { font-size: 10px; color: #64748b; margin: 4px 0 1px 0; text-transform: uppercase; letter-spacing: 0.5px; }
       .msg-params { font-size: 11px; margin: 2px 0; white-space: pre-wrap; word-break: break-word; }
       .msg-raw { margin-top: 4px; }
       .msg-raw summary { font-size: 10px; color: #475569; cursor: pointer; }
@@ -609,7 +631,18 @@
       }
 
       function msgBlock(cls, label, content) {
-        return `<div class="msg ${cls}"><div class="msg-label">${escapeHtml(label)}</div><pre class="msg-body">${escapeHtml(content)}</pre></div>`;
+        const escaped = escapeHtml(content);
+        return `<div class="msg ${cls}"><button class="msg-copy" onclick="copyMsg(this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${escapeHtml(label)}</div><pre class="msg-body">${escaped}</pre></div>`;
+      }
+
+      function copyMsg(btn) {
+        const pre = btn.parentElement.querySelector(".msg-body");
+        if (!pre) return;
+        const origHtml = btn.innerHTML;
+        navigator.clipboard.writeText(pre.textContent).then(() => {
+          btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+          setTimeout(() => { btn.innerHTML = origHtml; }, 1200);
+        });
       }
 
       function numberedLines(text, startLine, prefix) {
@@ -636,37 +669,110 @@
         } catch(_) { return null; }
       }
 
+      // Extract a JSON string value for a given key from possibly-incomplete JSON.
+      // Returns the string if the value is complete (closing quote found), or
+      // the partial string so far (with trailing "..." hint) if still streaming.
+      // Returns undefined if the key hasn't appeared yet.
+      function extractPartialJsonString(json, key) {
+        const needle = `"${key}"`;
+        const ki = json.indexOf(needle);
+        if (ki === -1) return undefined;
+        // Find the colon after the key
+        const afterKey = json.indexOf(":", ki + needle.length);
+        if (afterKey === -1) return undefined;
+        // Find the opening quote of the value
+        const openQ = json.indexOf('"', afterKey + 1);
+        if (openQ === -1) return undefined;
+        // Walk the string, handling escapes, looking for the closing quote
+        let val = "";
+        let i = openQ + 1;
+        while (i < json.length) {
+          if (json[i] === "\\") {
+            if (i + 1 < json.length) {
+              const esc = json[i + 1];
+              if (esc === "n") val += "\n";
+              else if (esc === "t") val += "\t";
+              else if (esc === "r") val += "\r";
+              else if (esc === "\\") val += "\\";
+              else if (esc === '"') val += '"';
+              else if (esc === "/") val += "/";
+              else if (esc === "u") {
+                // \uXXXX unicode escape
+                if (i + 5 < json.length) {
+                  const hex = json.substring(i + 2, i + 6);
+                  const cp = parseInt(hex, 16);
+                  if (!isNaN(cp)) {
+                    val += String.fromCharCode(cp);
+                    i += 6;
+                    continue;
+                  }
+                }
+                // Incomplete unicode escape
+                return { value: val, complete: false };
+              }
+              else val += esc;
+              i += 2;
+            } else {
+              // Backslash at very end — incomplete escape
+              return { value: val, complete: false };
+            }
+          } else if (json[i] === '"') {
+            return { value: val, complete: true };
+          } else {
+            val += json[i];
+            i++;
+          }
+        }
+        return { value: val, complete: false };
+      }
+
+      function renderFileEditDiff(argsStr, pending, startLine) {
+        const path = extractPartialJsonString(argsStr, "path");
+        const oldStr = extractPartialJsonString(argsStr, "old_string");
+        const newStr = extractPartialJsonString(argsStr, "new_string");
+        const create = argsStr.includes('"create"') && argsStr.includes("true");
+        const sl = startLine || 1;
+
+        // Not enough data yet to show anything pretty
+        if (!oldStr && !newStr) return null;
+
+        let html = '<div class="msg-diff">';
+        if (path) {
+          const pathLabel = escapeHtml(path.value) + (create ? " (new file)" : (startLine ? ":" + sl : ""));
+          html += `<div class="diff-file">${pathLabel}</div>`;
+        }
+        if (oldStr && !create) {
+          const label = oldStr.complete ? "replace" : "replace (streaming)";
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-del">${numberedLines(oldStr.value, sl, "-")}</pre>`;
+        }
+        if (newStr) {
+          const label = newStr.complete ? (create ? "content" : "with") : (create ? "content (streaming)" : "with (streaming)");
+          html += `<div class="diff-section-label">${label}</div>`;
+          html += `<pre class="diff-add">${numberedLines(newStr.value, sl, "+")}</pre>`;
+        } else if (oldStr && oldStr.complete && !create) {
+          // old_string is done but new_string hasn't started yet
+          html += `<div class="diff-section-label">with (waiting...)</div>`;
+        }
+        html += '</div>';
+        return html;
+      }
+
       function renderToolCallHtml(toolName, argsStr, pending, startLine) {
         const eName = escapeHtml(toolName);
-        if (pending) {
-          const label = `calling ${eName}...`;
-          return `<div class="msg msg-tool-call"><div class="msg-label">${label}</div><pre class="msg-body">${escapeHtml(argsStr)}</pre></div>`;
-        }
-        const label = `call ${eName}`;
+        const label = pending ? `calling ${eName}...` : `call ${eName}`;
         let bodyHtml = "";
         if (toolName === "file_edit") {
-          try {
-            const args = JSON.parse(argsStr);
-            const sl = startLine || 1;
-            if (args.create && args.new_string != null) {
-              bodyHtml = `<div class="msg-diff">`;
-              if (args.path) bodyHtml += `<div class="diff-file">${escapeHtml(args.path)} (new file)</div>`;
-              bodyHtml += `<pre class="diff-add">${numberedLines(args.new_string, 1, "+")}</pre></div>`;
-            } else if (args.old_string != null && args.new_string != null) {
-              bodyHtml = `<div class="msg-diff">`;
-              if (args.path) bodyHtml += `<div class="diff-file">${escapeHtml(args.path)}${startLine ? ":"+sl : ""}</div>`;
-              bodyHtml += `<pre class="diff-del">${numberedLines(args.old_string, sl, "-")}</pre>`;
-              bodyHtml += `<pre class="diff-add">${numberedLines(args.new_string, sl, "+")}</pre></div>`;
-            }
-          } catch (_) {}
-        } else {
+          const diffHtml = renderFileEditDiff(argsStr, pending, startLine);
+          if (diffHtml) bodyHtml = diffHtml;
+        } else if (!pending) {
           const pretty = prettyParams(argsStr);
           if (pretty) {
             bodyHtml = `<div class="msg-params">${pretty}</div>`;
           }
         }
         const rawDetails = `<details class="msg-raw"><summary>json</summary><pre class="msg-body">${escapeHtml(argsStr)}</pre></details>`;
-        return `<div class="msg msg-tool-call"><div class="msg-label">${label}</div>${bodyHtml}${rawDetails}</div>`;
+        return `<div class="msg msg-tool-call"><button class="msg-copy" onclick="copyMsg(this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${label}</div>${bodyHtml}${rawDetails}</div>`;
       }
 
       function extractStartLine(content) {
@@ -705,7 +811,7 @@
             const text = formatToolOutput(msg.content);
             const tc = msg.tool_call_id ? toolCallMap[msg.tool_call_id] : null;
             if (tc && tc.name === "read_file" && typeof tc.args.path === "string" && tc.args.path.endsWith(".rs")) {
-              const html = `<div class="msg msg-tool"><div class="msg-label">${escapeHtml("tool")}</div><pre class="msg-body">${highlightRustOutput(text)}</pre></div>`;
+              const html = `<div class="msg msg-tool"><button class="msg-copy" onclick="copyMsg(this)" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><div class="msg-label">${escapeHtml("tool")}</div><pre class="msg-body">${highlightRustOutput(text)}</pre></div>`;
               blocks.push(html);
             } else {
               blocks.push(msgBlock("msg-tool", "tool", text));
@@ -1063,27 +1169,69 @@
             }
           }
 
-          const renderLive = () => {
-            let html = "";
-            if (liveTimeline.length === 0) {
-              html += msgBlock("msg-assistant", "assistant", mergePrefix + "...");
-            } else {
-              let firstAssistant = true;
-              liveTimeline.forEach((entry) => {
-                if (entry.type === "reasoning") {
-                  html += msgBlock("msg-thinking", "thinking", entry.text || "...");
-                } else if (entry.type === "assistant") {
-                  const prefix = firstAssistant ? mergePrefix : "";
-                  firstAssistant = false;
-                  html += msgBlock("msg-assistant", "assistant", prefix + (entry.text || "..."));
-                } else if (entry.type === "tool_call") {
-                  html += renderToolCallHtml(entry.tool_name, entry.arguments || "{}", !!entry.pending, entry.startLine);
-                } else if (entry.type === "tool_result") {
-                  html += msgBlock("msg-tool", "tool", entry.output || "");
-                }
-              });
+          // Track how many timeline entries have been fully committed to the DOM.
+          // Only the entry at liveCommitted (the "tail") gets re-rendered on updates;
+          // entries before it are frozen in place.
+          let liveCommitted = 0;
+          let liveFirstAssistant = true; // tracks mergePrefix across entries
+          let streamPhase = "processing input";
+          setStatus("processing input...");
+
+          function liveEntryHtml(entry) {
+            if (entry.type === "reasoning") {
+              return msgBlock("msg-thinking", "thinking", entry.text || "...");
+            } else if (entry.type === "assistant") {
+              const prefix = liveFirstAssistant ? mergePrefix : "";
+              // Don't advance liveFirstAssistant here — caller decides when to freeze
+              return msgBlock("msg-assistant", "assistant", prefix + (entry.text || "..."));
+            } else if (entry.type === "tool_call") {
+              return renderToolCallHtml(entry.tool_name, entry.arguments || "{}", !!entry.pending, entry.startLine);
+            } else if (entry.type === "tool_result") {
+              return msgBlock("msg-tool", "tool", entry.output || "");
             }
-            setLiveHtml(html);
+            return "";
+          }
+
+          const renderLive = () => {
+            const liveEl = $("chat-log-live");
+            const wasNearBottom = chatLogIsNearBottom();
+
+            if (liveTimeline.length === 0) {
+              liveEl.innerHTML = msgBlock("msg-assistant", "assistant", mergePrefix + "...");
+              liveCommitted = 0;
+              liveFirstAssistant = true;
+              if (wasNearBottom) $("chat-log").scrollTop = $("chat-log").scrollHeight;
+              return;
+            }
+
+            // Commit all entries before the last one — they won't change anymore
+            while (liveCommitted < liveTimeline.length - 1) {
+              const entry = liveTimeline[liveCommitted];
+              const div = document.createElement("div");
+              div.className = "live-committed";
+              div.innerHTML = liveEntryHtml(entry);
+              // Insert before the tail element if it exists, else append
+              const tail = liveEl.querySelector(".live-tail");
+              if (tail) {
+                liveEl.insertBefore(div, tail);
+              } else {
+                liveEl.appendChild(div);
+              }
+              if (entry.type === "assistant") liveFirstAssistant = false;
+              liveCommitted++;
+            }
+
+            // Render/update only the tail (last) entry
+            const tailEntry = liveTimeline[liveTimeline.length - 1];
+            let tail = liveEl.querySelector(".live-tail");
+            if (!tail) {
+              tail = document.createElement("div");
+              tail.className = "live-tail";
+              liveEl.appendChild(tail);
+            }
+            tail.innerHTML = liveEntryHtml(tailEntry);
+
+            if (wasNearBottom) $("chat-log").scrollTop = $("chat-log").scrollHeight;
           };
 
           const handleEvent = async (evt) => {
@@ -1093,6 +1241,7 @@
               return false;
             }
             if (evt.type === "reasoning_delta") {
+              if (streamPhase === "processing input") { streamPhase = "thinking"; setStatus("thinking..."); }
               addReasoning(evt.content);
               streamingExtraTokens += roughTokenCount(evt.content);
               renderLive();
@@ -1100,6 +1249,7 @@
               return false;
             }
             if (evt.type === "delta") {
+              if (streamPhase !== "generating") { streamPhase = "generating"; setStatus("generating..."); }
               addDelta(evt.content);
               streamingExtraTokens += roughTokenCount(evt.content);
               renderLive();
@@ -1107,6 +1257,7 @@
               return false;
             }
             if (evt.type === "tool_call_start") {
+              if (streamPhase !== "generating") { streamPhase = "generating"; setStatus("generating..."); }
               liveTimeline.push({
                 type: "tool_call",
                 tool_name: evt.tool_name,
@@ -1123,6 +1274,14 @@
               );
               if (entry) {
                 entry.arguments += evt.arguments_delta || "";
+                // If this entry is already committed (not the tail), update its DOM
+                const entryIdx = liveTimeline.lastIndexOf(entry);
+                if (entryIdx < liveCommitted) {
+                  const committedDivs = $("chat-log-live").querySelectorAll(".live-committed");
+                  if (committedDivs[entryIdx]) {
+                    committedDivs[entryIdx].innerHTML = liveEntryHtml(entry);
+                  }
+                }
               }
               renderLive();
               return false;
@@ -1134,6 +1293,14 @@
               if (pending) {
                 pending.arguments = evt.arguments || "{}";
                 pending.pending = false;
+                // If this entry was already committed (not the tail), rebuild its DOM
+                const pendingIdx = liveTimeline.lastIndexOf(pending);
+                if (pendingIdx < liveCommitted) {
+                  const committedDivs = $("chat-log-live").querySelectorAll(".live-committed");
+                  if (committedDivs[pendingIdx]) {
+                    committedDivs[pendingIdx].innerHTML = liveEntryHtml(pending);
+                  }
+                }
               } else {
                 liveTimeline.push({
                   type: "tool_call",
@@ -1147,6 +1314,8 @@
               return false;
             }
             if (evt.type === "tool_result") {
+              streamPhase = "running tools";
+              setStatus("running tools...");
               const output = formatToolOutput(evt.result ?? {});
               const rawResult = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result ?? {});
               streamingExtraTokens += roughTokenCount(rawResult) + 4;
@@ -1154,7 +1323,17 @@
               const sl = extractStartLine(evt.result);
               if (sl != null) {
                 const tcEntry = liveTimeline.findLast(e => e.type === "tool_call" && e.tool_name === "file_edit");
-                if (tcEntry) tcEntry.startLine = sl;
+                if (tcEntry) {
+                  tcEntry.startLine = sl;
+                  // If that tool_call is already committed, update its DOM in place
+                  const tcIdx = liveTimeline.lastIndexOf(tcEntry);
+                  if (tcIdx < liveCommitted) {
+                    const committedDivs = $("chat-log-live").querySelectorAll(".live-committed");
+                    if (committedDivs[tcIdx]) {
+                      committedDivs[tcIdx].innerHTML = liveEntryHtml(tcEntry);
+                    }
+                  }
+                }
               }
               liveTimeline.push({
                 type: "tool_result",
@@ -1168,6 +1347,9 @@
               // Real token counts from the API — replace estimates
               currentContextTokens = evt.total_tokens;
               streamingExtraTokens = 0;
+              // Usage comes at end of a completion — next event is either done or a new round
+              streamPhase = "processing input";
+              setStatus("processing input...");
               renderContextSize(" (streaming)");
               return false;
             }
@@ -1443,6 +1625,64 @@
         $("stop-icon").style.display = on ? "" : "none";
       }
 
+      const AUTO_COMPACT_THRESHOLD = 70000;
+
+      async function doCompact(statusLabel = "compacting...") {
+        setStatus(statusLabel);
+        const res = await fetch("/api/compact", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ state_uuid: getHashStateUUID() }),
+        });
+        if (!res.ok) {
+          const err = await readResponseError(res);
+          throw new Error(err);
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let thinkingText = "";
+        let summaryText = "";
+        let donePayload = null;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let evt;
+            try { evt = JSON.parse(line); } catch(_) { continue; }
+            if (evt.type === "reasoning_delta") {
+              thinkingText += evt.content;
+              let html = msgBlock("msg-thinking", "thinking", thinkingText);
+              if (summaryText) html += msgBlock("msg-system", "compact summary", summaryText + "...");
+              setChatLogHtml(html);
+            } else if (evt.type === "delta") {
+              summaryText += evt.content;
+              let html = "";
+              if (thinkingText) html += msgBlock("msg-thinking", "thinking", thinkingText);
+              html += msgBlock("msg-system", "compact summary", summaryText);
+              setChatLogHtml(html);
+            } else if (evt.type === "usage") {
+              currentContextTokens = evt.total_tokens;
+              streamingExtraTokens = 0;
+              renderContextSize(" (compacting)");
+            } else if (evt.type === "done") {
+              donePayload = evt;
+            } else if (evt.type === "error") {
+              throw new Error(evt.error);
+            }
+          }
+        }
+        if (donePayload) {
+          await refresh(donePayload.state_uuid, "push");
+          setStatus("compacted");
+        }
+      }
+
       $("chat-form").addEventListener("submit", async (event) => {
         event.preventDefault();
         if (isStreaming) {
@@ -1456,10 +1696,17 @@
         const continueOnly = !input;
         $("chat_input").value = "";
         $("chat_input").style.height = "auto";
-        setStatus("streaming");
+        setStatus("connecting...");
         setStreamingUI(true);
         try {
           await streamChatRequest(input, continueOnly);
+
+          // Auto-compact + continue if over threshold
+          if (Number.isFinite(currentContextTokens) && currentContextTokens >= AUTO_COMPACT_THRESHOLD) {
+            await doCompact("auto-compacting (>70k tokens)...");
+            // Auto-continue after compaction
+            await streamChatRequest("", true);
+          }
         } catch (err) {
           setStatus(`${err.message}`);
         } finally {
@@ -1482,60 +1729,8 @@
       });
 
       $("compact-btn").addEventListener("click", async () => {
-        setStatus("compacting...");
         try {
-          const res = await fetch("/api/compact", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ state_uuid: getHashStateUUID() }),
-          });
-          if (!res.ok) {
-            const err = await readResponseError(res);
-            throw new Error(err);
-          }
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-          let thinkingText = "";
-          let summaryText = "";
-          let donePayload = null;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-            for (const line of lines) {
-              if (!line.trim()) continue;
-              let evt;
-              try { evt = JSON.parse(line); } catch(_) { continue; }
-              if (evt.type === "reasoning_delta") {
-                thinkingText += evt.content;
-                let html = msgBlock("msg-thinking", "thinking", thinkingText);
-                if (summaryText) html += msgBlock("msg-system", "compact summary", summaryText + "...");
-                setChatLogHtml(html);
-              } else if (evt.type === "delta") {
-                summaryText += evt.content;
-                let html = "";
-                if (thinkingText) html += msgBlock("msg-thinking", "thinking", thinkingText);
-                html += msgBlock("msg-system", "compact summary", summaryText);
-                setChatLogHtml(html);
-              } else if (evt.type === "usage") {
-                currentContextTokens = evt.total_tokens;
-                streamingExtraTokens = 0;
-                renderContextSize(" (compacting)");
-              } else if (evt.type === "done") {
-                donePayload = evt;
-              } else if (evt.type === "error") {
-                throw new Error(evt.error);
-              }
-            }
-          }
-          if (donePayload) {
-            await refresh(donePayload.state_uuid, "push");
-            setStatus("compacted");
-          }
+          await doCompact();
         } catch (err) {
           setStatus(`Compact error: ${err.message}`);
         }
