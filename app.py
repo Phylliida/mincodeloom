@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import copy
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -22,7 +25,6 @@ EVENT_LOG_PATH = DATA_DIR / "events.jsonl"
 TOOL_WORKDIR = APP_DIR.parent
 DEFAULT_WORKSPACE_PATH = str(TOOL_WORKDIR)
 BROWSE_TOOL_NAME = "browse"
-EDIT_TOOL_NAME = "edit"
 
 BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "pwd": {
@@ -34,13 +36,12 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         },
     },
     "ls": {
-        "description": "List files in a workspace path.",
+        "description": "List files in a workspace path, one per line.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Directory path. Default is '.'"},
                 "show_all": {"type": "boolean", "description": "Include hidden files."},
-                "long": {"type": "boolean", "description": "Use long listing format."},
             },
         },
     },
@@ -97,65 +98,31 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             },
         },
     },
-    "search": {
-        "description": "Recursively search all .rs files for items (functions, structs, impls, traits, etc.) matching a name. Returns query-ready paths, node types, and line numbers.",
+    "read_file": {
+        "description": "Read a file's contents with line numbers. Optionally specify a line range.",
         "parameters": {
             "type": "object",
-            "required": ["name"],
+            "required": ["path"],
             "properties": {
-                "name": {"type": "string", "description": "Name or substring to search for, matched case-insensitively."},
-                "exact": {"type": "boolean", "description": "If true, match the full item name exactly instead of substring."},
-                "kind": {"type": "string", "description": "Optional node type filter (e.g. function_item, struct_item, impl_item, trait_item, enum_item, const_item, mod_item)."},
-                "offset": {"type": "integer", "description": "Pagination offset. Each page returns up to 15 results."}
-            }
-        }
+                "path": {"type": "string", "description": "File path relative to workspace."},
+                "start_line": {"type": "integer", "description": "First line to read (1-based). Default is 1."},
+                "end_line": {"type": "integer", "description": "Last line to read (inclusive). Default is end of file."},
+            },
+        },
     },
-    EDIT_TOOL_NAME: {
+    "file_edit": {
         "description": (
-            "Edit Rust source files and todo/md files. Rust actions: create_file, delete_file, append, "
-            "replace/delete/insert_before/insert_after on nodes, append_child for containers. "
-            "Todo actions: add_header, add_item, check, uncheck, add_note, delete, replace."
+            "Edit a file by exact string replacement. Provide old_string (must match exactly once) "
+            "and new_string. To create a new file, set create=true and put content in new_string."
         ),
         "parameters": {
             "type": "object",
-            "required": ["action", "path"],
+            "required": ["path"],
             "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "create_file",
-                        "delete_file",
-                        "append",
-                        "replace",
-                        "delete",
-                        "insert_before",
-                        "insert_after",
-                        "append_child",
-                        "add_header",
-                        "add_item",
-                        "check",
-                        "uncheck",
-                        "add_note",
-                    ],
-                    "description": "The edit action to perform.",
-                },
-                "path": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "segments addressing the target. Examples: ['src/new.rs'], "
-                        "['src/lib.rs','old_fn'], ['src/lib.rs','impl Server','handle'], "
-                        "['plan.todo','Backend','Add auth']"
-                    ),
-                },
-                "content": {
-                    "type": "string",
-                    "description": (
-                        "The content for the action. Required for create_file, append, replace, "
-                        "insert_before, insert_after, append_child, add_header, add_item, add_note. "
-                        "Not used for delete, delete_file, check, uncheck."
-                    ),
-                },
+                "path": {"type": "string", "description": "File path relative to workspace."},
+                "old_string": {"type": "string", "description": "Exact text to find (must appear exactly once)."},
+                "new_string": {"type": "string", "description": "Replacement text, or full content when create=true."},
+                "create": {"type": "boolean", "description": "If true, create/overwrite the file with new_string."},
             },
         },
     },
@@ -170,6 +137,7 @@ DEFAULT_STATE: Dict[str, Any] = {
         "model": "Qwen3-Coder-Next",
         "workspace_path": DEFAULT_WORKSPACE_PATH,
         "builtin_tools": copy.deepcopy(DEFAULT_BUILTIN_TOOLS),
+        "mcp_servers": {},
     },
     "tools": {},
     "history": [],
@@ -286,10 +254,29 @@ def normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
             incoming_builtin = {**incoming_builtin, "browse": incoming_builtin.get("query")}
         if "rust_ast_query" in incoming_builtin and "browse" not in incoming_builtin:
             incoming_builtin = {**incoming_builtin, "browse": incoming_builtin.get("rust_ast_query")}
+        if "edit" in incoming_builtin and "file_edit" not in incoming_builtin:
+            incoming_builtin = {**incoming_builtin, "file_edit": incoming_builtin.get("edit")}
         for name in DEFAULT_BUILTIN_TOOLS:
             if name in incoming_builtin:
                 normalized_builtin[name] = bool(incoming_builtin[name])
     config["builtin_tools"] = normalized_builtin
+
+    mcp_servers = config.get("mcp_servers")
+    if not isinstance(mcp_servers, dict):
+        config["mcp_servers"] = {}
+    else:
+        cleaned: Dict[str, Any] = {}
+        for srv_name, srv_cfg in mcp_servers.items():
+            if isinstance(srv_cfg, dict) and isinstance(srv_cfg.get("command"), str):
+                tools_flags = srv_cfg.get("tools", {})
+                cleaned[srv_name] = {
+                    "command": srv_cfg["command"],
+                    "args": srv_cfg.get("args", []) if isinstance(srv_cfg.get("args"), list) else [],
+                    "env": srv_cfg.get("env", {}) if isinstance(srv_cfg.get("env"), dict) else {},
+                    "enabled": srv_cfg.get("enabled", True),
+                    "tools": tools_flags if isinstance(tools_flags, dict) else {},
+                }
+        config["mcp_servers"] = cleaned
 
     tools = state.get("tools")
     if not isinstance(tools, dict):
@@ -528,6 +515,150 @@ def run_shell_tool(command: List[str], runtime_ctx: Dict[str, Any], allow_nonzer
     }
 
 
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) client
+# ---------------------------------------------------------------------------
+
+_mcp_clients: Dict[str, "McpClient"] = {}
+_mcp_lock = threading.Lock()
+
+
+class McpClient:
+    """Minimal MCP client over stdio (newline-delimited JSON-RPC 2.0)."""
+
+    def __init__(self, name: str, command: str, args: List[str] | None = None, env: Dict[str, str] | None = None, cwd: str | None = None):
+        self.name = name
+        self.command = command
+        self.args = args or []
+        self.env = env or {}
+        self.cwd = cwd
+        self._process: subprocess.Popen | None = None
+        self._next_id = 1
+        self._tools_cache: List[Dict[str, Any]] | None = None
+
+    def _ensure_running(self):
+        if self._process is not None and self._process.poll() is None:
+            return
+        merged_env = {**os.environ, **self.env} if self.env else None
+        self._process = subprocess.Popen(
+            [self.command] + self.args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged_env,
+            cwd=self.cwd,
+        )
+        self._handshake()
+
+    def _send(self, method: str, params: Any = None, *, notification: bool = False) -> int | None:
+        msg: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        msg_id = None
+        if not notification:
+            msg_id = self._next_id
+            self._next_id += 1
+            msg["id"] = msg_id
+        if params is not None:
+            msg["params"] = params
+        raw = json.dumps(msg, ensure_ascii=False) + "\n"
+        self._process.stdin.write(raw.encode("utf-8"))
+        self._process.stdin.flush()
+        return msg_id
+
+    def _recv(self, msg_id: int) -> Any:
+        while True:
+            line = self._process.stdout.readline()
+            if not line:
+                stderr_tail = ""
+                if self._process.stderr:
+                    try:
+                        stderr_tail = self._process.stderr.read(2000).decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                raise RuntimeError(f"MCP server '{self.name}' closed (stderr: {stderr_tail})")
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if resp.get("id") == msg_id:
+                if "error" in resp:
+                    err = resp["error"]
+                    raise RuntimeError(f"MCP error: {err.get('message', str(err))}")
+                return resp.get("result")
+
+    def _handshake(self):
+        msg_id = self._send("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mincodeloom", "version": "0.1.0"},
+        })
+        self._recv(msg_id)
+        self._send("notifications/initialized", notification=True)
+        self._tools_cache = None
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        if self._tools_cache is not None:
+            return self._tools_cache
+        self._ensure_running()
+        msg_id = self._send("tools/list")
+        result = self._recv(msg_id)
+        self._tools_cache = result.get("tools", [])
+        return self._tools_cache
+
+    def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        self._ensure_running()
+        msg_id = self._send("tools/call", {"name": tool_name, "arguments": arguments})
+        result = self._recv(msg_id)
+        parts = result.get("content", []) if isinstance(result, dict) else []
+        texts = []
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(part.get("text", ""))
+            elif isinstance(part, dict):
+                texts.append(json.dumps(part, ensure_ascii=False))
+        return "\n".join(texts) if texts else json.dumps(result, ensure_ascii=False)
+
+    def stop(self):
+        if self._process is not None and self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+        self._process = None
+        self._tools_cache = None
+
+
+def get_mcp_client(name: str, server_config: Dict[str, Any], workspace_path: str | None = None) -> McpClient:
+    cwd = server_config.get("cwd") or workspace_path
+    with _mcp_lock:
+        client = _mcp_clients.get(name)
+        if client is not None:
+            if (client.command == server_config["command"]
+                    and client.args == server_config.get("args", [])
+                    and client.cwd == cwd):
+                return client
+            client.stop()
+        client = McpClient(
+            name=name,
+            command=server_config["command"],
+            args=server_config.get("args", []),
+            env=server_config.get("env", {}),
+            cwd=cwd,
+        )
+        _mcp_clients[name] = client
+        return client
+
+
+def stop_all_mcp_clients():
+    with _mcp_lock:
+        for client in _mcp_clients.values():
+            client.stop()
+        _mcp_clients.clear()
+
+
+atexit.register(stop_all_mcp_clients)
+
+
 def ensure_runtime_context(runtime_ctx: Dict[str, Any]) -> None:
     if "workspace_dir" not in runtime_ctx:
         runtime_ctx["workspace_dir"] = DEFAULT_WORKSPACE_PATH
@@ -606,180 +737,6 @@ def run_browse_tool(parsed_args: Dict[str, Any], runtime_ctx: Dict[str, Any]) ->
     return output_text
 
 
-def run_search_tool(parsed_args: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> str:
-    ensure_runtime_context(runtime_ctx)
-
-    name = parsed_args.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("search requires a non-empty 'name' string")
-    name = name.strip()
-
-    exact = bool(parsed_args.get("exact", False))
-
-    kind_raw = parsed_args.get("kind")
-    kind: str | None
-    if kind_raw is None:
-        kind = None
-    elif isinstance(kind_raw, str) and kind_raw.strip():
-        kind = kind_raw.strip()
-    else:
-        raise ValueError("kind must be a non-empty string when provided")
-
-    offset_arg = parsed_args.get("offset", 0)
-    try:
-        offset = int(offset_arg)
-    except (TypeError, ValueError):
-        raise ValueError("offset must be an integer") from None
-    if offset < 0:
-        raise ValueError("offset must be >= 0")
-
-    workspace_dir = workspace_dir_from_runtime(runtime_ctx)
-    args = [
-        sys.executable,
-        str(APP_DIR / "rust_ast.py"),
-        "search",
-        str(workspace_dir),
-        name,
-        "--offset",
-        str(offset),
-    ]
-    if exact:
-        args.append("--exact")
-    if kind:
-        args.extend(["--kind", kind])
-
-    completed = subprocess.run(
-        args,
-        cwd=workspace_dir,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if completed.returncode != 0:
-        error_text = (completed.stderr or completed.stdout).strip()
-        raise RuntimeError(error_text or f"rust_ast.py search failed with code {completed.returncode}")
-
-    return clip_text(completed.stdout.rstrip("\n"), max_chars=20000)
-
-
-def run_edit_tool(parsed_args: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> str:
-    ensure_runtime_context(runtime_ctx)
-
-    action = parsed_args.get("action")
-    if not isinstance(action, str) or not action.strip():
-        raise ValueError("action must be a non-empty string")
-    action = action.strip()
-    valid_actions = {
-        "create_file",
-        "delete_file",
-        "append",
-        "replace",
-        "delete",
-        "insert_before",
-        "insert_after",
-        "append_child",
-        "add_header",
-        "add_item",
-        "check",
-        "uncheck",
-        "add_note",
-    }
-    if action not in valid_actions:
-        raise ValueError(f"Unknown action '{action}'")
-
-    path_segments = parse_path_segments(parsed_args.get("path"), allow_empty=False)
-    content = parsed_args.get("content")
-    file_ext = Path(path_segments[0]).suffix.lower()
-    rust_ext = ".rs"
-    todo_exts = {".todo", ".md"}
-
-    actions_requiring_content = {
-        "create_file",
-        "append",
-        "replace",
-        "insert_before",
-        "insert_after",
-        "append_child",
-        "add_header",
-        "add_item",
-        "add_note",
-    }
-    if action in actions_requiring_content:
-        if not isinstance(content, str):
-            raise ValueError(f"content is required for action '{action}'")
-        content_text = content
-    else:
-        if content is not None and not isinstance(content, str):
-            raise ValueError("content must be a string when provided")
-        content_text = content if isinstance(content, str) else ""
-
-    if action in {"create_file", "delete_file", "append", "add_header"} and len(path_segments) != 1:
-        raise ValueError(f"{action} requires path to contain exactly 1 segment")
-    if action in {"append_child", "add_item"} and len(path_segments) != 2:
-        raise ValueError(f"{action} requires path to contain exactly 2 segments")
-    if action in {"check", "uncheck", "add_note"} and len(path_segments) != 3:
-        raise ValueError(f"{action} requires path to contain exactly 3 segments")
-    if action in {"replace", "delete", "insert_before", "insert_after"} and len(path_segments) not in {2, 3}:
-        raise ValueError(f"{action} requires path to contain 2 or 3 segments")
-
-    rust_only_actions = {"append", "insert_before", "insert_after", "append_child"}
-    todo_only_actions = {"add_header", "add_item", "check", "uncheck", "add_note"}
-    if action in rust_only_actions and file_ext != rust_ext:
-        raise ValueError(f"action '{action}' requires a .rs file")
-    if action in todo_only_actions and file_ext not in todo_exts:
-        raise ValueError(f"action '{action}' requires a .todo or .md file")
-
-    if action in {"replace", "delete"} and file_ext in todo_exts:
-        if action == "replace" and len(path_segments) != 3:
-            raise ValueError("todo replace requires path to contain exactly 3 segments")
-        if action == "delete" and len(path_segments) not in {2, 3}:
-            raise ValueError("todo delete requires path to contain 2 or 3 segments")
-
-    if action in {"create_file", "delete_file"} and file_ext not in {rust_ext, *todo_exts}:
-        raise ValueError("create_file/delete_file support .rs, .todo, and .md files")
-
-    file_path = resolve_workspace_path(path_segments[0], runtime_ctx)
-
-    if action == "create_file":
-        if file_path.exists():
-            raise ValueError(f"File already exists: {path_segments[0]}")
-    else:
-        if not file_path.exists():
-            raise ValueError(f"File not found: {path_segments[0]}")
-        if not file_path.is_file():
-            raise ValueError(f"path[0] is not a file: {path_segments[0]}")
-
-    workspace_dir = workspace_dir_from_runtime(runtime_ctx)
-    args = [
-        sys.executable,
-        str(APP_DIR / "rust_ast.py"),
-        "edit",
-        str(workspace_dir),
-        action,
-        *path_segments,
-    ]
-
-    stdin_text: str | None = None
-    if action in actions_requiring_content:
-        args.append("--stdin")
-        stdin_text = content_text
-
-    completed = subprocess.run(
-        args,
-        cwd=workspace_dir,
-        input=stdin_text,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    if completed.returncode != 0:
-        error_text = (completed.stderr or completed.stdout).strip()
-        raise RuntimeError(error_text or f"rust_ast.py edit failed with code {completed.returncode}")
-
-    return clip_text(completed.stdout.rstrip("\n"), max_chars=20000)
-
 
 def shell_result_output(result: Dict[str, Any]) -> str:
     stdout = str(result.get("stdout", ""))
@@ -802,13 +759,10 @@ def execute_builtin_tool(tool_name: str, parsed_args: Dict[str, Any], runtime_ct
         path = str(parsed_args.get("path", "."))
         resolve_workspace_path(path, runtime_ctx)
         show_all = bool(parsed_args.get("show_all", False))
-        long_format = bool(parsed_args.get("long", False))
 
-        command = ["ls"]
+        command = ["ls", "-1"]
         if show_all:
             command.append("-a")
-        if long_format:
-            command.append("-l")
         command.append(path)
         result = run_shell_tool(command, runtime_ctx, allow_nonzero=False)
         return {"output": shell_result_output(result)}
@@ -866,16 +820,76 @@ def execute_builtin_tool(tool_name: str, parsed_args: Dict[str, Any], runtime_ct
     if tool_name == BROWSE_TOOL_NAME:
         return {"output": run_browse_tool(parsed_args, runtime_ctx)}
 
-    if tool_name == "search":
-        return {"output": run_search_tool(parsed_args, runtime_ctx)}
+    if tool_name == "read_file":
+        path_str = parsed_args.get("path")
+        if not isinstance(path_str, str) or not path_str.strip():
+            raise ValueError("path is required")
+        resolved = resolve_workspace_path(path_str.strip(), runtime_ctx)
+        if not resolved.is_file():
+            raise ValueError(f"Not a file: {path_str}")
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(keepends=False)
+        total = len(lines)
+        try:
+            start = max(1, int(parsed_args.get("start_line", 1)))
+        except (TypeError, ValueError):
+            start = 1
+        try:
+            end = min(total, int(parsed_args.get("end_line", total)))
+        except (TypeError, ValueError):
+            end = total
+        selected = lines[start - 1 : end]
+        numbered = [f"{i:>6}\t{line}" for i, line in enumerate(selected, start=start)]
+        header = f"{path_str} ({total} lines)"
+        if start > 1 or end < total:
+            header += f" [showing {start}-{end}]"
+        return {"output": clip_text(header + "\n" + "\n".join(numbered), max_chars=20000)}
 
-    if tool_name == EDIT_TOOL_NAME:
-        return {"output": run_edit_tool(parsed_args, runtime_ctx)}
+    if tool_name == "file_edit":
+        path_str = parsed_args.get("path")
+        if not isinstance(path_str, str) or not path_str.strip():
+            raise ValueError("path is required")
+        resolved = resolve_workspace_path(path_str.strip(), runtime_ctx)
+        create = bool(parsed_args.get("create", False))
+        old_string = parsed_args.get("old_string")
+        new_string = parsed_args.get("new_string")
+
+        if create:
+            if not isinstance(new_string, str):
+                raise ValueError("new_string is required when create=true")
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(new_string, encoding="utf-8")
+            return {"output": f"Created {path_str} ({len(new_string)} chars)"}
+
+        if not isinstance(old_string, str):
+            raise ValueError("old_string is required")
+        if not isinstance(new_string, str):
+            raise ValueError("new_string is required")
+        if not resolved.is_file():
+            raise ValueError(f"File not found: {path_str}")
+        text = resolved.read_text(encoding="utf-8")
+        count = text.count(old_string)
+        if count == 0:
+            raise ValueError("old_string not found in file")
+        if count > 1:
+            raise ValueError(f"old_string matches {count} locations; provide more surrounding context to be unique")
+        start_line = text[:text.index(old_string)].count("\n") + 1
+        new_text = text.replace(old_string, new_string, 1)
+        resolved.write_text(new_text, encoding="utf-8")
+        return {
+            "output": f"Edited {path_str} (line {start_line}, {len(old_string)} -> {len(new_string)} chars)",
+            "start_line": start_line,
+        }
 
     raise ValueError(f"Unknown builtin tool '{tool_name}'")
 
 
-def build_tools_payload(tools: Dict[str, Dict[str, Any]], builtin_flags: Dict[str, bool]) -> List[Dict[str, Any]]:
+def build_tools_payload(
+    tools: Dict[str, Dict[str, Any]],
+    builtin_flags: Dict[str, bool],
+    mcp_servers: Dict[str, Dict[str, Any]] | None = None,
+    workspace_path: str | None = None,
+) -> List[Dict[str, Any]]:
     payload: List[Dict[str, Any]] = []
     for name, tool in tools.items():
         payload.append(
@@ -903,6 +917,34 @@ def build_tools_payload(tools: Dict[str, Dict[str, Any]], builtin_flags: Dict[st
                 },
             }
         )
+
+    used_names = {entry["function"]["name"] for entry in payload}
+    for srv_name, srv_cfg in (mcp_servers or {}).items():
+        if not srv_cfg.get("enabled", True):
+            continue
+        tool_flags = srv_cfg.get("tools", {})
+        try:
+            client = get_mcp_client(srv_name, srv_cfg, workspace_path=workspace_path)
+            for mcp_tool in client.list_tools():
+                tname = mcp_tool.get("name", "")
+                if not tname or tname in used_names:
+                    continue
+                if tool_flags and not tool_flags.get(tname, True):
+                    continue
+                used_names.add(tname)
+                payload.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tname,
+                            "description": mcp_tool.get("description", ""),
+                            "parameters": mcp_tool.get("inputSchema", {"type": "object", "properties": {}}),
+                        },
+                    }
+                )
+        except Exception:
+            pass
+
     return payload
 
 
@@ -933,6 +975,24 @@ def execute_tool_call(
                 return execute_builtin_tool(tool_name, parsed_args, runtime_ctx)
             except Exception as exc:  # noqa: BLE001
                 return {"output": f"ERROR: {exc}"}
+
+        mcp_servers = runtime_ctx.get("mcp_servers", {})
+        for srv_name, srv_cfg in mcp_servers.items():
+            if not srv_cfg.get("enabled", True):
+                continue
+            tool_flags = srv_cfg.get("tools", {})
+            if tool_flags and not tool_flags.get(tool_name, True):
+                continue
+            try:
+                ws = str(runtime_ctx.get("workspace_dir", DEFAULT_WORKSPACE_PATH))
+                client = get_mcp_client(srv_name, srv_cfg, workspace_path=ws)
+                srv_tool_names = [t.get("name") for t in client.list_tools()]
+                if tool_name in srv_tool_names:
+                    result_text = client.call_tool(tool_name, parsed_args)
+                    return {"output": clip_text(result_text)}
+            except Exception as exc:  # noqa: BLE001
+                return {"output": f"ERROR: MCP '{srv_name}' tool '{tool_name}': {exc}"}
+
         return {"output": f"ERROR: Unknown tool '{tool_name}'"}
 
     try:
@@ -1057,6 +1117,7 @@ def save_config():
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         config["workspace_path"] = str(workspace_dir)
+        stop_all_mcp_clients()
         updated_fields.append("workspace_path")
 
     if "builtin_tools" in payload:
@@ -1073,6 +1134,17 @@ def save_config():
         config["builtin_tools"] = normalized_builtin
         updated_fields.append("builtin_tools")
 
+    if "mcp_servers" in payload:
+        incoming_mcp = payload["mcp_servers"]
+        if not isinstance(incoming_mcp, dict):
+            return jsonify({"ok": False, "error": "mcp_servers must be an object"}), 400
+        current_mcp = config.get("mcp_servers", {})
+        current_mcp.update(incoming_mcp)
+        # Re-normalize through the state normalizer
+        config["mcp_servers"] = current_mcp
+        normalize_state(state)
+        updated_fields.append("mcp_servers")
+
     event = append_state_snapshot(state, "set_config", {"updated_fields": updated_fields}, parent_state_uuid=parent_event["state_uuid"])
     return jsonify(
         {
@@ -1081,6 +1153,82 @@ def save_config():
             "state_hash": event["state_hash"],
         }
     )
+
+
+@app.get("/api/mcp_tools")
+def list_mcp_tools():
+    state, _, _, _ = load_state()
+    workspace_path = state["config"].get("workspace_path", DEFAULT_WORKSPACE_PATH)
+    mcp_servers = state["config"].get("mcp_servers", {})
+    result: Dict[str, Any] = {}
+    for srv_name, srv_cfg in mcp_servers.items():
+        if not srv_cfg.get("enabled", True):
+            result[srv_name] = {"error": "disabled"}
+            continue
+        try:
+            client = get_mcp_client(srv_name, srv_cfg, workspace_path=workspace_path)
+            tools_list = client.list_tools()
+            result[srv_name] = {
+                "tools": [
+                    {"name": t.get("name", ""), "description": t.get("description", "")}
+                    for t in tools_list
+                ]
+            }
+        except Exception as exc:
+            result[srv_name] = {"error": str(exc)}
+    return jsonify({"ok": True, "mcp_tools": result})
+
+
+@app.post("/api/mcp_servers")
+def add_mcp_server():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name", "")).strip()
+    command = str(payload.get("command", "")).strip()
+    if not name:
+        return jsonify({"ok": False, "error": "name is required"}), 400
+    if not command:
+        return jsonify({"ok": False, "error": "command is required"}), 400
+    args = payload.get("args", [])
+    if not isinstance(args, list):
+        return jsonify({"ok": False, "error": "args must be an array"}), 400
+    env = payload.get("env", {})
+    if not isinstance(env, dict):
+        return jsonify({"ok": False, "error": "env must be an object"}), 400
+    enabled = payload.get("enabled", True)
+
+    state, parent_event, _, _ = load_state()
+    mcp = state["config"].setdefault("mcp_servers", {})
+    existed = name in mcp
+    tool_flags = payload.get("tools", {})
+    if not isinstance(tool_flags, dict):
+        tool_flags = {}
+    mcp[name] = {"command": command, "args": args, "env": env, "enabled": bool(enabled), "tools": tool_flags}
+    event = append_state_snapshot(
+        state, "update_mcp_server" if existed else "add_mcp_server",
+        {"server_name": name}, parent_state_uuid=parent_event["state_uuid"],
+    )
+    return jsonify({"ok": True, "state_uuid": event["state_uuid"], "state_hash": event["state_hash"]})
+
+
+@app.delete("/api/mcp_servers/<path:server_name>")
+def delete_mcp_server(server_name: str):
+    name = server_name.strip()
+    if not name:
+        return jsonify({"ok": False, "error": "server name is required"}), 400
+    state, parent_event, _, _ = load_state()
+    mcp = state["config"].get("mcp_servers", {})
+    if name not in mcp:
+        return jsonify({"ok": False, "error": f"MCP server not found: {name}"}), 404
+    del mcp[name]
+    with _mcp_lock:
+        client = _mcp_clients.pop(name, None)
+        if client:
+            client.stop()
+    event = append_state_snapshot(
+        state, "remove_mcp_server",
+        {"server_name": name}, parent_state_uuid=parent_event["state_uuid"],
+    )
+    return jsonify({"ok": True, "state_uuid": event["state_uuid"], "state_hash": event["state_hash"]})
 
 
 @app.post("/api/tools")
@@ -1237,11 +1385,12 @@ def chat():
     config = state["config"]
     tools = state["tools"]
     builtin_flags = config.get("builtin_tools", copy.deepcopy(DEFAULT_BUILTIN_TOOLS))
-    tools_payload = build_tools_payload(tools, builtin_flags)
+    mcp_servers = config.get("mcp_servers", {})
     try:
         workspace_dir = resolve_workspace_dir(str(config.get("workspace_path", DEFAULT_WORKSPACE_PATH)))
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    tools_payload = build_tools_payload(tools, builtin_flags, mcp_servers, workspace_path=str(workspace_dir))
 
     messages = copy.deepcopy(state["history"])
     merge_continue = False
@@ -1256,6 +1405,7 @@ def chat():
     runtime_ctx: Dict[str, Any] = {}
     ensure_runtime_context(runtime_ctx)
     runtime_ctx["workspace_dir"] = workspace_dir
+    runtime_ctx["mcp_servers"] = mcp_servers
 
     try:
         api_key = config.get("api_key", "")
@@ -1271,10 +1421,13 @@ def chat():
             completion = client.chat.completions.create(**request_args)
             message = completion.choices[0].message
             content = coerce_content(message.content)
+            reasoning = coerce_content(getattr(message, "reasoning_content", None))
             tool_calls = message.tool_calls or []
             runtime_ctx["response_index"] = int(runtime_ctx["response_index"]) + 1
 
             assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
+            if reasoning:
+                assistant_message["reasoning_content"] = reasoning
             if tool_calls:
                 assistant_message["tool_calls"] = []
                 for tool_call in tool_calls:
@@ -1369,11 +1522,12 @@ def chat_stream():
     config = state["config"]
     tools = state["tools"]
     builtin_flags = config.get("builtin_tools", copy.deepcopy(DEFAULT_BUILTIN_TOOLS))
-    tools_payload = build_tools_payload(tools, builtin_flags)
+    mcp_servers = config.get("mcp_servers", {})
     try:
         workspace_dir = resolve_workspace_dir(str(config.get("workspace_path", DEFAULT_WORKSPACE_PATH)))
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    tools_payload = build_tools_payload(tools, builtin_flags, mcp_servers, workspace_path=str(workspace_dir))
 
     messages = copy.deepcopy(state["history"])
     merge_continue = False
@@ -1388,6 +1542,7 @@ def chat_stream():
     runtime_ctx: Dict[str, Any] = {}
     ensure_runtime_context(runtime_ctx)
     runtime_ctx["workspace_dir"] = workspace_dir
+    runtime_ctx["mcp_servers"] = mcp_servers
 
     @stream_with_context
     def generate():
@@ -1423,7 +1578,9 @@ def chat_stream():
 
                 completion_stream = client.chat.completions.create(**request_args)
                 content_parts: List[str] = []
+                reasoning_parts: List[str] = []
                 partial_tool_calls: List[Dict[str, Any]] = []
+                announced_tool_indices: set = set()
 
                 for chunk in completion_stream:
                     if not chunk.choices:
@@ -1431,6 +1588,11 @@ def chat_stream():
                     delta = chunk.choices[0].delta
                     if delta is None:
                         continue
+
+                    delta_reasoning = getattr(delta, "reasoning_content", None)
+                    if delta_reasoning and isinstance(delta_reasoning, str):
+                        reasoning_parts.append(delta_reasoning)
+                        yield stream_line({"type": "reasoning_delta", "content": delta_reasoning})
 
                     delta_content = getattr(delta, "content", None)
                     if delta_content:
@@ -1441,13 +1603,33 @@ def chat_stream():
                         content_parts.append(text_piece)
                         yield stream_line({"type": "delta", "content": text_piece})
 
-                    update_partial_tool_calls(partial_tool_calls, getattr(delta, "tool_calls", None))
+                    delta_tool_calls = getattr(delta, "tool_calls", None)
+                    update_partial_tool_calls(partial_tool_calls, delta_tool_calls)
+
+                    for idx, partial in enumerate(partial_tool_calls):
+                        if idx in announced_tool_indices:
+                            continue
+                        name = partial.get("function", {}).get("name", "").strip()
+                        if name:
+                            announced_tool_indices.add(idx)
+                            yield stream_line({"type": "tool_call_start", "tool_name": name, "index": idx})
+
+                    for tc_delta in (delta_tool_calls or []):
+                        idx = getattr(tc_delta, "index", 0)
+                        fn = getattr(tc_delta, "function", None)
+                        if fn:
+                            args_frag = getattr(fn, "arguments", None)
+                            if isinstance(args_frag, str) and args_frag:
+                                yield stream_line({"type": "tool_call_delta", "index": idx, "arguments_delta": args_frag})
 
                 content = "".join(content_parts)
+                reasoning = "".join(reasoning_parts)
                 tool_calls = finalize_partial_tool_calls(partial_tool_calls)
                 runtime_ctx["response_index"] = int(runtime_ctx["response_index"]) + 1
 
                 assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
+                if reasoning:
+                    assistant_message["reasoning_content"] = reasoning
                 if tool_calls:
                     assistant_message["tool_calls"] = tool_calls
                 if merge_continue:

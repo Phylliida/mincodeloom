@@ -79,6 +79,22 @@
       .checkbox-row input {
         width: auto;
       }
+      .mcp-server {
+        border: 1px solid #334155;
+        border-radius: 6px;
+        padding: 8px;
+        margin: 6px 0;
+        background: #020617;
+      }
+      .mcp-server-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .mcp-server-header strong {
+        flex: 1;
+      }
       .pill {
         display: inline-block;
         margin: 3px 6px 3px 0;
@@ -113,6 +129,79 @@
       #chat-log {
         max-height: 75vh;
         overflow-y: auto;
+        border: 1px solid #334155;
+        border-radius: 6px;
+        background: #020617;
+        padding: 6px;
+      }
+      .msg {
+        border: 1px solid #1e293b;
+        border-radius: 4px;
+        margin: 3px 0;
+        padding: 4px 8px;
+      }
+      .msg-label {
+        font-size: 10px;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .msg-body {
+        margin: 2px 0 0 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: none;
+        background: transparent;
+        padding: 0;
+        font: inherit;
+      }
+      .msg-user { border-left: 3px solid #3b82f6; }
+      .msg-assistant { border-left: 3px solid #22c55e; }
+      .msg-thinking { border-left: 3px solid #6366f1; color: #64748b; font-style: italic; }
+      .msg-tool-call { border-left: 3px solid #f59e0b; font-size: 12px; }
+      .msg-tool { border-left: 3px solid #6b7280; font-size: 12px; }
+      .msg-system { border-left: 3px solid #8b5cf6; }
+      .msg-diff { margin: 4px 0; }
+      .diff-file { font-size: 11px; color: #94a3b8; margin-bottom: 2px; }
+      .diff-del, .diff-add {
+        margin: 0;
+        padding: 2px 6px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font: inherit;
+        border: none;
+      }
+      .diff-del { background: #1c0a0a; border-left: 2px solid #ef4444; color: #fca5a5; }
+      .diff-add { background: #0a1c0a; border-left: 2px solid #22c55e; color: #86efac; }
+      .msg-params { font-size: 11px; margin: 2px 0; white-space: pre-wrap; word-break: break-word; }
+      .msg-raw { margin-top: 4px; }
+      .msg-raw summary { font-size: 10px; color: #475569; cursor: pointer; }
+      .msg-raw pre { margin: 2px 0 0 0; font-size: 11px; max-height: 200px; overflow-y: auto; }
+      #send-btn {
+        width: 36px;
+        min-width: 36px;
+        padding: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      details.card > summary {
+        cursor: pointer;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      details.card > summary::before {
+        content: "\25b6";
+        font-size: 10px;
+        transition: transform 0.15s;
+      }
+      details.card[open] > summary::before {
+        transform: rotate(90deg);
+      }
+      details.card > summary h2 {
+        margin: 0;
       }
       .meta {
         font-size: 12px;
@@ -177,8 +266,8 @@
     </div>
     <div class="meta" id="meta"></div>
     <div class="grid">
-      <section class="card">
-        <h2>Model Config</h2>
+      <details class="card" id="config-section">
+        <summary><h2>Config</h2></summary>
         <form id="config-form">
           <label>
             Base URL
@@ -218,21 +307,40 @@
               <span>Enable browse tool</span>
             </label>
             <label class="checkbox-row">
-              <input id="builtin_search" type="checkbox">
-              <span>Enable search tool</span>
+              <input id="builtin_read_file" type="checkbox">
+              <span>Enable read_file tool</span>
             </label>
             <label class="checkbox-row">
-              <input id="builtin_edit" type="checkbox">
-              <span>Enable edit tool</span>
+              <input id="builtin_file_edit" type="checkbox">
+              <span>Enable file_edit tool</span>
             </label>
           </div>
-          <div class="meta"><code>browse</code> + <code>edit</code> use <code>path</code> as string-array segments.</div>
-          <button type="submit">Save Config</button>
+          <div class="meta"><code>browse</code> uses <code>path</code> as string-array segments.</div>
         </form>
-      </section>
 
-      <section class="card">
-        <h2>Tools</h2>
+        <h2 style="margin-top:12px">MCP Servers</h2>
+        <div id="mcp-list"></div>
+        <form id="mcp-add-form">
+          <div class="row">
+            <label>
+              Name
+              <input id="mcp_name" placeholder="verus" required>
+            </label>
+            <label>
+              Command
+              <input id="mcp_command" placeholder="/path/to/mcp-server" required>
+            </label>
+          </div>
+          <label>
+            Args (space-separated, optional)
+            <input id="mcp_args" placeholder="">
+          </label>
+          <button type="submit">Add MCP Server</button>
+        </form>
+      </details>
+
+      <details class="card" id="tools-section">
+        <summary><h2>Tools</h2></summary>
         <div id="tool-list"></div>
         <form id="tool-form">
           <div class="row">
@@ -265,12 +373,12 @@
           </label>
           <button type="submit">Add / Update Tool</button>
         </form>
-      </section>
+      </details>
 
       <section class="card">
         <h2>Chat</h2>
         <button class="secondary" id="clear-history" type="button">Clear History</button>
-        <pre id="chat-log"></pre>
+        <div id="chat-log"></div>
         <div class="meta" id="chat-context-size">context_tokens~unknown</div>
       </section>
 
@@ -283,10 +391,11 @@
     <div class="chat-input-bar">
       <form id="chat-form">
         <div class="row">
-          <input id="chat_input" placeholder="square the number 1024" required>
-          <button type="submit">Send</button>
-          <button class="secondary" id="continue-stream" type="button">Continue</button>
-          <button class="secondary" id="stop-stream" type="button" disabled>Stop</button>
+          <input id="chat_input" placeholder="message (empty = continue)">
+          <button type="submit" id="send-btn" title="Send / Continue">
+            <svg id="send-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <svg id="stop-icon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+          </button>
         </div>
       </form>
     </div>
@@ -395,6 +504,10 @@
         const lines = [];
         liveTimeline.forEach((entry) => {
           if (!entry || typeof entry !== "object") return;
+          if (entry.type === "reasoning") {
+            lines.push(`[thinking] ${String(entry.text || "")}`);
+            return;
+          }
           if (entry.type === "assistant") {
             lines.push(String(entry.text || ""));
             return;
@@ -437,17 +550,129 @@
         return distance <= thresholdPx;
       }
 
-      function setChatLogText(text) {
+      function setChatLogHtml(html) {
         const el = $("chat-log");
         const wasNearBottom = chatLogIsNearBottom();
         const prevScrollTop = el.scrollTop;
-        el.textContent = text;
+        // Snapshot which <details> are open (by index)
+        const openSet = new Set();
+        el.querySelectorAll("details.msg-raw").forEach((d, i) => {
+          if (d.open) openSet.add(i);
+        });
+        el.innerHTML = html;
+        // Restore open state
+        if (openSet.size > 0) {
+          el.querySelectorAll("details.msg-raw").forEach((d, i) => {
+            if (openSet.has(i)) d.open = true;
+          });
+        }
         if (wasNearBottom) {
           el.scrollTop = el.scrollHeight;
           return;
         }
         const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
         el.scrollTop = Math.min(prevScrollTop, maxScrollTop);
+      }
+
+      function msgBlock(cls, label, content) {
+        return `<div class="msg ${cls}"><div class="msg-label">${escapeHtml(label)}</div><pre class="msg-body">${escapeHtml(content)}</pre></div>`;
+      }
+
+      function numberedLines(text, startLine, prefix) {
+        const lines = text.split("\n");
+        const pad = String(startLine + lines.length - 1).length;
+        return lines.map((line, i) => {
+          const num = String(startLine + i).padStart(pad, " ");
+          return `${prefix}${num} | ${escapeHtml(line)}`;
+        }).join("\n");
+      }
+
+      function prettyParams(argsStr) {
+        try {
+          const args = JSON.parse(argsStr);
+          if (typeof args !== "object" || args === null || Array.isArray(args)) return null;
+          const keys = Object.keys(args);
+          if (keys.length === 0) return null;
+          const parts = keys.map(k => {
+            const v = args[k];
+            const vs = typeof v === "string" ? v : JSON.stringify(v);
+            return `<span style="color:#64748b">${escapeHtml(k)}:</span> ${escapeHtml(vs)}`;
+          });
+          return parts.join("  ");
+        } catch(_) { return null; }
+      }
+
+      function renderToolCallHtml(toolName, argsStr, pending, startLine) {
+        const eName = escapeHtml(toolName);
+        if (pending) {
+          const label = `calling ${eName}...`;
+          return `<div class="msg msg-tool-call"><div class="msg-label">${label}</div><pre class="msg-body">${escapeHtml(argsStr)}</pre></div>`;
+        }
+        const label = `call ${eName}`;
+        let bodyHtml = "";
+        if (toolName === "file_edit") {
+          try {
+            const args = JSON.parse(argsStr);
+            const sl = startLine || 1;
+            if (args.create && args.new_string != null) {
+              bodyHtml = `<div class="msg-diff">`;
+              if (args.path) bodyHtml += `<div class="diff-file">${escapeHtml(args.path)} (new file)</div>`;
+              bodyHtml += `<pre class="diff-add">${numberedLines(args.new_string, 1, "+")}</pre></div>`;
+            } else if (args.old_string != null && args.new_string != null) {
+              bodyHtml = `<div class="msg-diff">`;
+              if (args.path) bodyHtml += `<div class="diff-file">${escapeHtml(args.path)}${startLine ? ":"+sl : ""}</div>`;
+              bodyHtml += `<pre class="diff-del">${numberedLines(args.old_string, sl, "-")}</pre>`;
+              bodyHtml += `<pre class="diff-add">${numberedLines(args.new_string, sl, "+")}</pre></div>`;
+            }
+          } catch (_) {}
+        } else {
+          const pretty = prettyParams(argsStr);
+          if (pretty) {
+            bodyHtml = `<div class="msg-params">${pretty}</div>`;
+          }
+        }
+        const rawDetails = `<details class="msg-raw"><summary>json</summary><pre class="msg-body">${escapeHtml(argsStr)}</pre></details>`;
+        return `<div class="msg msg-tool-call"><div class="msg-label">${label}</div>${bodyHtml}${rawDetails}</div>`;
+      }
+
+      function extractStartLine(content) {
+        try {
+          const obj = typeof content === "string" ? JSON.parse(content) : content;
+          if (obj && typeof obj === "object" && typeof obj.start_line === "number") return obj.start_line;
+        } catch(_) {}
+        return null;
+      }
+
+      function historyToHtml(history) {
+        if (!history || history.length === 0) return "";
+        const blocks = [];
+        // Build a map from tool_call_id to start_line from tool result messages
+        const startLineMap = {};
+        history.forEach((msg) => {
+          if (msg.role === "tool" && msg.tool_call_id) {
+            const sl = extractStartLine(msg.content);
+            if (sl != null) startLineMap[msg.tool_call_id] = sl;
+          }
+        });
+        history.forEach((msg) => {
+          if (msg.role === "tool") {
+            blocks.push(msgBlock("msg-tool", "tool", formatToolOutput(msg.content)));
+            return;
+          }
+          if (msg.reasoning_content) {
+            const rc = typeof msg.reasoning_content === "string" ? msg.reasoning_content : JSON.stringify(msg.reasoning_content);
+            blocks.push(msgBlock("msg-thinking", "thinking", rc));
+          }
+          const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+          blocks.push(msgBlock(`msg-${msg.role}`, msg.role, content));
+          if (msg.tool_calls) {
+            msg.tool_calls.forEach((tc) => {
+              const sl = tc.id ? startLineMap[tc.id] : null;
+              blocks.push(renderToolCallHtml(tc.function.name, tc.function.arguments || "{}", false, sl));
+            });
+          }
+        });
+        return blocks.join("");
       }
 
       function escapeHtml(value) {
@@ -485,34 +710,67 @@
         $("tool-list").innerHTML = customHtml + builtinHtml;
       }
 
-      function chatLinesFromHistory(history) {
-        if (!history || history.length === 0) {
-          return [];
-        }
-        const lines = [];
-        history.forEach((msg, idx) => {
-          if (msg.role === "tool") {
-            lines.push(`[${idx}] tool:`);
-            const toolOutput = formatToolOutput(msg.content);
-            const outputLines = String(toolOutput).split("\n");
-            outputLines.forEach((line) => lines.push(line));
-            return;
-          }
+      let cachedMcpTools = {};
 
-          const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-          lines.push(`[${idx}] ${msg.role}: ${content}`);
-          if (msg.tool_calls) {
-            msg.tool_calls.forEach((tc) => {
-              lines.push(`  tool_call -> ${tc.function.name}(${tc.function.arguments})`);
-            });
+      function renderMcpList(mcpServers, mcpToolsInfo) {
+        const container = $("mcp-list");
+        const serverNames = Object.keys(mcpServers || {});
+        if (serverNames.length === 0) {
+          container.innerHTML = "<p>No MCP servers configured.</p>";
+          return;
+        }
+        let html = "";
+        for (const srvName of serverNames) {
+          const srv = mcpServers[srvName];
+          const info = mcpToolsInfo[srvName] || {};
+          const toolFlags = srv.tools || {};
+          const escapedName = escapeHtml(srvName);
+          const encodedName = encodeURIComponent(srvName);
+
+          html += `<div class="mcp-server">`;
+          html += `<div class="mcp-server-header">`;
+          html += `<strong>${escapedName}</strong>`;
+          html += `<code style="font-size:11px">${escapeHtml(srv.command)}</code>`;
+          html += `<button class="tool-remove mcp-remove" type="button" data-mcp-name="${encodedName}">Remove</button>`;
+          html += `</div>`;
+
+          if (info.error) {
+            html += `<div class="meta" style="color:#f87171">${escapeHtml(info.error)}</div>`;
+          } else if (info.tools && info.tools.length > 0) {
+            html += `<div class="checkbox-grid">`;
+            for (const t of info.tools) {
+              const tName = t.name;
+              const checked = Object.keys(toolFlags).length === 0 ? true : toolFlags[tName] !== false;
+              const cbId = `mcp_tool_${encodedName}_${encodeURIComponent(tName)}`;
+              html += `<label class="checkbox-row">`;
+              html += `<input type="checkbox" id="${cbId}" data-mcp-server="${encodedName}" data-mcp-tool="${encodeURIComponent(tName)}" ${checked ? "checked" : ""}>`;
+              html += `<span>${escapeHtml(tName)}</span>`;
+              html += `</label>`;
+            }
+            html += `</div>`;
+          } else {
+            html += `<div class="meta">No tools discovered yet.</div>`;
           }
-        });
-        return lines;
+          html += `</div>`;
+        }
+        container.innerHTML = html;
+      }
+
+      async function fetchMcpTools() {
+        try {
+          const payload = await api("/api/mcp_tools");
+          cachedMcpTools = payload.mcp_tools || {};
+        } catch (_) {
+          cachedMcpTools = {};
+        }
       }
 
       function renderChat(history) {
-        const lines = chatLinesFromHistory(history);
-        setChatLogText(lines.length > 0 ? lines.join("\n") : "No messages yet.");
+        if (!history || history.length === 0) {
+          setChatLogHtml('<div class="meta">No messages yet.</div>');
+          return;
+        }
+        setChatLogHtml(historyToHtml(history));
       }
 
       async function streamChatRequest(userInput, continueOnly = false) {
@@ -549,6 +807,16 @@
             }
           };
 
+          const addReasoning = (text) => {
+            const piece = String(text || "");
+            const last = liveTimeline[liveTimeline.length - 1];
+            if (last && last.type === "reasoning") {
+              last.text += piece;
+            } else {
+              liveTimeline.push({ type: "reasoning", text: piece });
+            }
+          };
+
           let mergePrefix = "";
           let mergeBaseHistory = baseHistory;
           if (continueOnly && baseHistory.length > 0 && baseHistory[baseHistory.length - 1].role === "assistant") {
@@ -557,34 +825,29 @@
           }
 
           const renderLive = () => {
-            const lines = chatLinesFromHistory(mergeBaseHistory);
-            if (lines.length > 0) {
-              lines.push("");
-            }
+            let html = historyToHtml(mergeBaseHistory);
             if (!continueOnly) {
-              lines.push(`user: ${userInput}`);
+              html += msgBlock("msg-user", "user", userInput);
             }
-
             if (liveTimeline.length === 0) {
-              lines.push(`assistant: ${mergePrefix}...`);
+              html += msgBlock("msg-assistant", "assistant", mergePrefix + "...");
             } else {
               let firstAssistant = true;
               liveTimeline.forEach((entry) => {
-                if (entry.type === "assistant") {
+                if (entry.type === "reasoning") {
+                  html += msgBlock("msg-thinking", "thinking", entry.text || "...");
+                } else if (entry.type === "assistant") {
                   const prefix = firstAssistant ? mergePrefix : "";
                   firstAssistant = false;
-                  lines.push(`assistant: ${prefix}${entry.text || "..."}`);
+                  html += msgBlock("msg-assistant", "assistant", prefix + (entry.text || "..."));
                 } else if (entry.type === "tool_call") {
-                  lines.push(`tool_call -> ${entry.tool_name}(${entry.arguments || "{}"})`);
+                  html += renderToolCallHtml(entry.tool_name, entry.arguments || "{}", !!entry.pending, entry.startLine);
                 } else if (entry.type === "tool_result") {
-                  lines.push("tool:");
-                  const outputLines = String(entry.output || "").split("\n");
-                  outputLines.forEach((line) => lines.push(line));
+                  html += msgBlock("msg-tool", "tool", entry.output || "");
                 }
               });
             }
-
-            setChatLogText(lines.join("\n"));
+            setChatLogHtml(html);
           };
 
           const handleEvent = async (evt) => {
@@ -593,22 +856,62 @@
               setHashStateUUID(evt.state_uuid, "replace");
               return false;
             }
+            if (evt.type === "reasoning_delta") {
+              addReasoning(evt.content);
+              renderLive();
+              return false;
+            }
             if (evt.type === "delta") {
               addDelta(evt.content);
               renderLive();
               return false;
             }
-            if (evt.type === "tool_call") {
+            if (evt.type === "tool_call_start") {
               liveTimeline.push({
                 type: "tool_call",
                 tool_name: evt.tool_name,
-                arguments: evt.arguments || "{}"
+                arguments: "",
+                pending: true,
+                tcIndex: evt.index ?? 0
               });
+              renderLive();
+              return false;
+            }
+            if (evt.type === "tool_call_delta") {
+              const entry = liveTimeline.findLast(
+                (e) => e.type === "tool_call" && e.pending && e.tcIndex === (evt.index ?? 0)
+              );
+              if (entry) {
+                entry.arguments += evt.arguments_delta || "";
+              }
+              renderLive();
+              return false;
+            }
+            if (evt.type === "tool_call") {
+              const pending = liveTimeline.findLast(
+                (e) => e.type === "tool_call" && e.pending && e.tool_name === evt.tool_name
+              );
+              if (pending) {
+                pending.arguments = evt.arguments || "{}";
+                pending.pending = false;
+              } else {
+                liveTimeline.push({
+                  type: "tool_call",
+                  tool_name: evt.tool_name,
+                  arguments: evt.arguments || "{}"
+                });
+              }
               renderLive();
               return false;
             }
             if (evt.type === "tool_result") {
               const output = formatToolOutput(evt.result ?? {});
+              // Extract start_line and attach to the most recent file_edit tool call
+              const sl = extractStartLine(evt.result);
+              if (sl != null) {
+                const tcEntry = liveTimeline.findLast(e => e.type === "tool_call" && e.tool_name === "file_edit");
+                if (tcEntry) tcEntry.startLine = sl;
+              }
               liveTimeline.push({
                 type: "tool_result",
                 output
@@ -716,34 +1019,60 @@
         $("builtin_rg").checked = Boolean(builtin.rg);
         $("builtin_rg_files").checked = Boolean(builtin.rg_files);
         $("builtin_browse").checked = Boolean(builtin.browse || builtin.query || builtin.rust_ast_query);
-        $("builtin_search").checked = Boolean(builtin.search);
-        $("builtin_edit").checked = Boolean(builtin.edit);
+        $("builtin_read_file").checked = Boolean(builtin.read_file);
+        $("builtin_file_edit").checked = Boolean(builtin.file_edit);
+
+        const mcpServers = cachedState.config.mcp_servers || {};
+        if (Object.keys(mcpServers).length > 0) {
+          await fetchMcpTools();
+        } else {
+          cachedMcpTools = {};
+        }
+        renderMcpList(mcpServers, cachedMcpTools);
       }
 
-      $("config-form").addEventListener("submit", async (event) => {
-        event.preventDefault();
+      let configSaveTimer = null;
+      function gatherConfig() {
+        return {
+          base_url: $("base_url").value.trim(),
+          api_key: $("api_key").value.trim(),
+          workspace_path: $("workspace_path").value.trim(),
+          model: $("model").value.trim(),
+          builtin_tools: {
+            pwd: $("builtin_pwd").checked,
+            ls: $("builtin_ls").checked,
+            rg: $("builtin_rg").checked,
+            rg_files: $("builtin_rg_files").checked,
+            browse: $("builtin_browse").checked,
+            read_file: $("builtin_read_file").checked,
+            file_edit: $("builtin_file_edit").checked
+          }
+        };
+      }
+      async function autoSaveConfig() {
         try {
-          const payload = await api("/api/config", "POST", {
-            base_url: $("base_url").value.trim(),
-            api_key: $("api_key").value.trim(),
-            workspace_path: $("workspace_path").value.trim(),
-            model: $("model").value.trim(),
-            builtin_tools: {
-              pwd: $("builtin_pwd").checked,
-              ls: $("builtin_ls").checked,
-              rg: $("builtin_rg").checked,
-              rg_files: $("builtin_rg_files").checked,
-              browse: $("builtin_browse").checked,
-              search: $("builtin_search").checked,
-              edit: $("builtin_edit").checked
-            }
-          });
+          const payload = await api("/api/config", "POST", gatherConfig());
           await refresh(payload.state_uuid, "push");
           setStatus("");
         } catch (err) {
           setStatus(`Config error: ${err.message}`);
         }
+      }
+      function scheduleConfigSave() {
+        if (configSaveTimer) clearTimeout(configSaveTimer);
+        configSaveTimer = setTimeout(autoSaveConfig, 400);
+      }
+
+      $("config-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        autoSaveConfig();
       });
+      for (const id of ["builtin_pwd", "builtin_ls", "builtin_rg", "builtin_rg_files", "builtin_browse", "builtin_read_file", "builtin_file_edit"]) {
+        $(id).addEventListener("change", scheduleConfigSave);
+      }
+      for (const id of ["base_url", "api_key", "workspace_path", "model"]) {
+        $(id).addEventListener("change", scheduleConfigSave);
+      }
 
       $("tool-form").addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -780,48 +1109,108 @@
         }
       });
 
-      $("chat-form").addEventListener("submit", async (event) => {
+      $("mcp-add-form").addEventListener("submit", async (event) => {
         event.preventDefault();
-        if (isStreaming) return;
-        const input = $("chat_input").value.trim();
-        if (!input) return;
-        $("chat_input").value = "";
-        setStatus("streaming");
-        isStreaming = true;
-        $("stop-stream").disabled = false;
+        const name = $("mcp_name").value.trim();
+        const command = $("mcp_command").value.trim();
+        const argsRaw = $("mcp_args").value.trim();
+        const args = argsRaw ? argsRaw.split(/\s+/) : [];
+        if (!name || !command) return;
         try {
-          await streamChatRequest(input, false);
+          const payload = await api("/api/mcp_servers", "POST", { name, command, args });
+          $("mcp_name").value = "";
+          $("mcp_command").value = "";
+          $("mcp_args").value = "";
+          await refresh(payload.state_uuid, "push");
+          setStatus("");
         } catch (err) {
-          setStatus(`${err.message}`);
-        } finally {
-          isStreaming = false;
-          $("stop-stream").disabled = true;
-          renderContextSize();
+          setStatus(`MCP error: ${err.message}`);
         }
       });
 
-      $("continue-stream").addEventListener("click", async () => {
-        if (isStreaming) return;
-        setStatus("streaming");
-        isStreaming = true;
-        $("stop-stream").disabled = false;
-        try {
-          await streamChatRequest("", true);
-        } catch (err) {
-          setStatus(`${err.message}`);
-        } finally {
-          isStreaming = false;
-          $("stop-stream").disabled = true;
-          renderContextSize();
-        }
-      });
+      $("mcp-list").addEventListener("click", async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
 
-      $("stop-stream").addEventListener("click", () => {
-        if (!isStreaming || !activeStreamController) {
+        const removeBtn = target.closest("button[data-mcp-name]");
+        if (removeBtn instanceof HTMLElement) {
+          const encodedName = removeBtn.getAttribute("data-mcp-name");
+          if (!encodedName) return;
+          const srvName = decodeURIComponent(encodedName);
+          try {
+            const payload = await api(`/api/mcp_servers/${encodeURIComponent(srvName)}`, "DELETE");
+            await refresh(payload.state_uuid, "push");
+            setStatus("");
+          } catch (err) {
+            setStatus(`MCP remove error: ${err.message}`);
+          }
           return;
         }
-        setStatus("");
-        activeStreamController.abort();
+      });
+
+      $("mcp-list").addEventListener("change", async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement) || target.type !== "checkbox") return;
+        const srvNameEnc = target.getAttribute("data-mcp-server");
+        const toolNameEnc = target.getAttribute("data-mcp-tool");
+        if (!srvNameEnc || !toolNameEnc) return;
+        const srvName = decodeURIComponent(srvNameEnc);
+        const toolName = decodeURIComponent(toolNameEnc);
+        const mcpServers = cachedState?.config?.mcp_servers || {};
+        const srv = mcpServers[srvName];
+        if (!srv) return;
+
+        const toolFlags = Object.assign({}, srv.tools || {});
+        const allToolNames = (cachedMcpTools[srvName]?.tools || []).map(t => t.name);
+        if (Object.keys(toolFlags).length === 0) {
+          for (const tn of allToolNames) toolFlags[tn] = true;
+        }
+        toolFlags[toolName] = target.checked;
+
+        try {
+          const payload = await api("/api/mcp_servers", "POST", {
+            name: srvName,
+            command: srv.command,
+            args: srv.args || [],
+            env: srv.env || {},
+            enabled: srv.enabled !== false,
+            tools: toolFlags
+          });
+          await refresh(payload.state_uuid, "push");
+          setStatus("");
+        } catch (err) {
+          setStatus(`MCP tool toggle error: ${err.message}`);
+        }
+      });
+
+      function setStreamingUI(on) {
+        isStreaming = on;
+        $("send-icon").style.display = on ? "none" : "";
+        $("stop-icon").style.display = on ? "" : "none";
+      }
+
+      $("chat-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (isStreaming) {
+          if (activeStreamController) {
+            setStatus("");
+            activeStreamController.abort();
+          }
+          return;
+        }
+        const input = $("chat_input").value.trim();
+        const continueOnly = !input;
+        $("chat_input").value = "";
+        setStatus("streaming");
+        setStreamingUI(true);
+        try {
+          await streamChatRequest(input, continueOnly);
+        } catch (err) {
+          setStatus(`${err.message}`);
+        } finally {
+          setStreamingUI(false);
+          renderContextSize();
+        }
       });
 
       $("clear-history").addEventListener("click", async () => {
