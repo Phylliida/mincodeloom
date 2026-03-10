@@ -838,12 +838,29 @@ def execute_builtin_tool(tool_name: str, parsed_args: Dict[str, Any], runtime_ct
             end = min(total, int(parsed_args.get("end_line", total)))
         except (TypeError, ValueError):
             end = total
+        explicit_range = parsed_args.get("start_line") is not None or parsed_args.get("end_line") is not None
         selected = lines[start - 1 : end]
         numbered = [f"{i:>6}\t{line}" for i, line in enumerate(selected, start=start)]
         header = f"{path_str} ({total} lines)"
         if start > 1 or end < total:
             header += f" [showing {start}-{end}]"
-        return {"output": clip_text(header + "\n" + "\n".join(numbered), max_chars=20000)}
+        body = header + "\n" + "\n".join(numbered)
+        max_chars = 20000
+        if not explicit_range and len(body) > max_chars:
+            # Truncate at line boundary
+            truncated = body[:max_chars]
+            last_nl = truncated.rfind("\n")
+            if last_nl > 0:
+                truncated = truncated[:last_nl]
+            # Figure out the last displayed line number
+            shown_lines = truncated.count("\n")  # header is first line
+            last_shown = start + shown_lines - 1
+            truncated += (
+                f"\n\n... truncated ({total - last_shown} more lines). "
+                f"Use read_file with start_line={last_shown + 1} to see the rest."
+            )
+            body = truncated
+        return {"output": body}
 
     if tool_name == "file_edit":
         path_str = parsed_args.get("path")
@@ -1370,6 +1387,73 @@ def append_history():
             "context_tokens_estimate": estimate_context_tokens(state["history"]),
         }
     )
+
+
+@app.post("/api/compact")
+def compact():
+    payload = request.get_json(silent=True) or {}
+    requested_uuid = str(payload.get("state_uuid", "")).strip() or None
+    state, parent_event, _, _ = load_state(requested_uuid)
+    config = state["config"]
+    history = state["history"]
+    if not history:
+        return jsonify({"ok": False, "error": "nothing to compact"}), 400
+
+    compaction_prompt = (
+        "Summarize this conversation so far. Include: what the user asked for, "
+        "key decisions made, current state of the work, file paths and code discussed, "
+        "and anything needed to continue seamlessly. Be concise but thorough."
+    )
+    messages = [{"role": "system", "content": compaction_prompt}] + copy.deepcopy(history)
+
+    @stream_with_context
+    def generate():
+        try:
+            api_key = config.get("api_key", "")
+            client = OpenAI(
+                base_url=config["base_url"],
+                api_key=api_key or "EMPTY",
+                timeout=httpx.Timeout(None, connect=10.0),
+            )
+            completion_stream = client.chat.completions.create(
+                messages=messages,
+                model=config["model"],
+                stream=True,
+            )
+            content_parts: List[str] = []
+            reasoning_parts: List[str] = []
+            for chunk in completion_stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                delta_reasoning = getattr(delta, "reasoning_content", None)
+                if delta_reasoning and isinstance(delta_reasoning, str):
+                    reasoning_parts.append(delta_reasoning)
+                    yield stream_line({"type": "reasoning_delta", "content": delta_reasoning})
+                delta_content = getattr(delta, "content", None)
+                if delta_content and isinstance(delta_content, str):
+                    content_parts.append(delta_content)
+                    yield stream_line({"type": "delta", "content": delta_content})
+
+            summary = "".join(content_parts)
+            state["history"] = [{"role": "system", "content": summary}]
+            event = append_state_snapshot(state, "compact", {}, parent_state_uuid=parent_event["state_uuid"])
+            yield stream_line({
+                "type": "done",
+                "state_uuid": event["state_uuid"],
+                "state_hash": event["state_hash"],
+                "context_tokens_estimate": estimate_context_tokens(state["history"]),
+            })
+        except Exception as exc:  # noqa: BLE001
+            yield stream_line({
+                "type": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc(limit=5),
+            })
+
+    return Response(generate(), mimetype="application/x-ndjson")
 
 
 @app.post("/api/chat")
