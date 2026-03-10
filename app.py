@@ -1404,7 +1404,7 @@ def compact():
         "key decisions made, current state of the work, file paths and code discussed, "
         "and anything needed to continue seamlessly. Be concise but thorough."
     )
-    messages = [{"role": "system", "content": compaction_prompt}] + copy.deepcopy(history)
+    messages = copy.deepcopy(history) + [{"role": "user", "content": compaction_prompt}]
 
     @stream_with_context
     def generate():
@@ -1419,10 +1419,19 @@ def compact():
                 messages=messages,
                 model=config["model"],
                 stream=True,
+                stream_options={"include_usage": True},
             )
             content_parts: List[str] = []
             reasoning_parts: List[str] = []
             for chunk in completion_stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    yield stream_line({
+                        "type": "usage",
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                    })
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -1438,7 +1447,47 @@ def compact():
                     yield stream_line({"type": "delta", "content": delta_content})
 
             summary = "".join(content_parts)
-            state["history"] = [{"role": "system", "content": summary}]
+
+            # Preserve lookup tool calls and their results, trimmed to ~15000 tokens
+            lookup_messages: List[Dict[str, Any]] = []
+            lookup_tc_ids: set = set()
+            # First pass: find assistant messages with lookup tool calls
+            for msg in history:
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {})
+                        if fn.get("name") == "lookup":
+                            lookup_tc_ids.add(tc.get("id"))
+            # Second pass: collect the assistant messages (with only lookup tool_calls)
+            # and matching tool result messages, in order
+            for msg in history:
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    lookup_tcs = [tc for tc in msg["tool_calls"] if tc.get("id") in lookup_tc_ids]
+                    if lookup_tcs:
+                        trimmed = copy.deepcopy(msg)
+                        trimmed["tool_calls"] = lookup_tcs
+                        trimmed["content"] = ""
+                        lookup_messages.append(trimmed)
+                elif msg.get("role") == "tool" and msg.get("tool_call_id") in lookup_tc_ids:
+                    lookup_messages.append(copy.deepcopy(msg))
+
+            # Trim from the front to fit within ~15000 tokens
+            max_lookup_tokens = 15000
+            while lookup_messages and estimate_context_tokens(lookup_messages) > max_lookup_tokens:
+                removed = lookup_messages.pop(0)
+                # Also remove orphaned tool results or assistant messages
+                if removed.get("role") == "assistant" and removed.get("tool_calls"):
+                    orphan_ids = {tc.get("id") for tc in removed.get("tool_calls", [])}
+                    lookup_messages = [m for m in lookup_messages if m.get("tool_call_id") not in orphan_ids]
+                elif removed.get("role") == "tool":
+                    # Remove assistant message if it has no remaining tool results
+                    tc_id = removed.get("tool_call_id")
+                    if tc_id:
+                        for m in lookup_messages:
+                            if m.get("role") == "assistant" and m.get("tool_calls"):
+                                m["tool_calls"] = [tc for tc in m["tool_calls"] if tc.get("id") != tc_id]
+
+            state["history"] = lookup_messages + [{"role": "assistant", "content": summary}]
             event = append_state_snapshot(state, "compact", {}, parent_state_uuid=parent_event["state_uuid"])
             yield stream_line({
                 "type": "done",
@@ -1651,11 +1700,14 @@ def chat_stream():
                 ev = save_progress({"prompt": prompt, "stage": "user_message"})
                 yield stream_line({"type": "snapshot", "state_uuid": ev["state_uuid"]})
 
+            last_usage: Dict[str, Any] = {}
+
             while True:
                 request_args: Dict[str, Any] = {
                     "messages": messages,
                     "model": config["model"],
                     "stream": True,
+                    "stream_options": {"include_usage": True},
                 }
                 if tools_payload:
                     request_args["tools"] = tools_payload
@@ -1667,6 +1719,15 @@ def chat_stream():
                 announced_tool_indices: set = set()
 
                 for chunk in completion_stream:
+                    # Extract usage from final chunk
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        last_usage = {
+                            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                        }
+                        yield stream_line({"type": "usage", **last_usage})
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -1783,13 +1844,14 @@ def chat_stream():
                 },
                 parent_state_uuid=current_parent_uuid,
             )
+            context_tokens = last_usage.get("total_tokens") or estimate_context_tokens(messages)
             yield stream_line(
                 {
                     "type": "done",
                     "reply": final_reply,
                     "history": messages,
                     "tool_trace": tool_trace,
-                    "context_tokens_estimate": estimate_context_tokens(messages),
+                    "context_tokens_estimate": context_tokens,
                     "state_uuid": event["state_uuid"],
                     "state_hash": event["state_hash"],
                 }

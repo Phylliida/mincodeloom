@@ -327,6 +327,12 @@
           <div class="meta"><code>browse</code> uses <code>path</code> as string-array segments.</div>
         </form>
 
+        <h2 style="margin-top:12px">Display</h2>
+        <label class="checkbox-row">
+          <input id="virtual_scroll" type="checkbox" checked>
+          <span>Virtual scroll (only render visible messages)</span>
+        </label>
+
         <h2 style="margin-top:12px">MCP Servers</h2>
         <div id="mcp-list"></div>
         <form id="mcp-add-form">
@@ -387,8 +393,7 @@
       <section class="card">
         <h2>Chat</h2>
         <button class="secondary" id="clear-history" type="button">Clear History</button>
-        <div id="chat-log"></div>
-        <div id="chat-log-live"></div>
+        <div id="chat-log"><div id="chat-log-live"></div></div>
         <div class="meta" id="chat-context-size">context_tokens~unknown</div>
       </section>
 
@@ -548,36 +553,38 @@
         $("meta").textContent = `state_uuid=${payload.state_uuid} | state_hash=${payload.state_hash} | events=${payload.event_count}`;
       }
 
+      function roughTokenCount(text) {
+        return text ? Math.max(1, Math.ceil(text.length / 4)) : 0;
+      }
+
+      let streamingExtraTokens = 0;
+
       function renderContextSize(extra = "") {
-        const base = Number.isFinite(currentContextTokens)
-          ? `context_tokens~${currentContextTokens}`
+        const total = Number.isFinite(currentContextTokens)
+          ? currentContextTokens + streamingExtraTokens
+          : NaN;
+        const base = Number.isFinite(total)
+          ? `context_tokens~${total}`
           : "context_tokens~unknown";
         $("chat-context-size").textContent = `${base}${extra}`;
       }
 
       function chatLogIsNearBottom(thresholdPx = 8) {
-        const el = $("chat-log").parentElement;
+        const el = $("chat-log");
         const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
         return distance <= thresholdPx;
       }
 
-      function chatLogScrollParent() {
-        // Both chat-log and chat-log-live share the same scroll parent
-        return $("chat-log").parentElement;
-      }
-
       function setChatLogHtml(html) {
         const el = $("chat-log");
-        const sp = chatLogScrollParent();
         const wasNearBottom = chatLogIsNearBottom();
-        const prevScrollTop = sp.scrollTop;
+        const prevScrollTop = el.scrollTop;
         // Snapshot which <details> are open (by index)
         const openSet = new Set();
         el.querySelectorAll("details.msg-raw").forEach((d, i) => {
           if (d.open) openSet.add(i);
         });
-        el.innerHTML = html;
-        $("chat-log-live").innerHTML = "";
+        el.innerHTML = html + '<div id="chat-log-live"></div>';
         // Restore open state
         if (openSet.size > 0) {
           el.querySelectorAll("details.msg-raw").forEach((d, i) => {
@@ -585,19 +592,19 @@
           });
         }
         if (wasNearBottom) {
-          sp.scrollTop = sp.scrollHeight;
+          el.scrollTop = el.scrollHeight;
           return;
         }
-        const maxScrollTop = Math.max(0, sp.scrollHeight - sp.clientHeight);
-        sp.scrollTop = Math.min(prevScrollTop, maxScrollTop);
+        const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.min(prevScrollTop, maxScrollTop);
       }
 
       function setLiveHtml(html) {
-        const sp = chatLogScrollParent();
+        const el = $("chat-log");
         const wasNearBottom = chatLogIsNearBottom();
         $("chat-log-live").innerHTML = html;
         if (wasNearBottom) {
-          sp.scrollTop = sp.scrollHeight;
+          el.scrollTop = el.scrollHeight;
         }
       }
 
@@ -670,8 +677,8 @@
         return null;
       }
 
-      function historyToHtml(history) {
-        if (!history || history.length === 0) return "";
+      function historyToBlocks(history) {
+        if (!history || history.length === 0) return [];
         const blocks = [];
         // Build maps from tool_call_id to start_line and to tool call info
         const startLineMap = {};
@@ -718,7 +725,98 @@
             });
           }
         });
-        return blocks.join("");
+        return blocks;
+      }
+
+      function historyToHtml(history) {
+        return historyToBlocks(history).join("");
+      }
+
+      // --- Virtual scroll for chat-log ---
+      const VS_BUFFER = 5;       // extra blocks above/below viewport
+      const VS_EST_H = 60;       // estimated height for unmeasured blocks
+      let vsBlocks = [];         // [{html, height}]
+      let vsStart = 0;           // first rendered index
+      let vsEnd = -1;            // last rendered index
+      let vsActive = false;      // true when virtual scroll is managing chat-log
+      let vsScrollRAF = null;    // requestAnimationFrame id for scroll handler
+
+      function vsInit(blocks) {
+        vsBlocks = blocks.map(html => ({ html, height: VS_EST_H }));
+        vsStart = 0;
+        vsEnd = -1;
+        vsActive = true;
+        const el = $("chat-log");
+        el.innerHTML = '<div id="vs-top"></div><div id="vs-mid"></div><div id="vs-bot"></div><div id="chat-log-live"></div>';
+        vsUpdate(true);
+      }
+
+      function vsUpdate(scrollToBottom) {
+        const el = $("chat-log");
+        if (!vsActive || vsBlocks.length === 0) return;
+
+        const scrollTop = el.scrollTop;
+        const viewH = el.clientHeight;
+
+        // Find first visible block
+        let cum = 0, visStart = 0;
+        for (let i = 0; i < vsBlocks.length; i++) {
+          if (cum + vsBlocks[i].height > scrollTop) { visStart = i; break; }
+          cum += vsBlocks[i].height;
+          if (i === vsBlocks.length - 1) visStart = i;
+        }
+        // Find last visible block
+        let visEnd = visStart, h = 0;
+        for (let i = visStart; i < vsBlocks.length; i++) {
+          visEnd = i;
+          h += vsBlocks[i].height;
+          if (h >= viewH) break;
+        }
+
+        const newStart = Math.max(0, visStart - VS_BUFFER);
+        const newEnd = Math.min(vsBlocks.length - 1, visEnd + VS_BUFFER);
+
+        if (newStart === vsStart && newEnd === vsEnd && !scrollToBottom) return;
+
+        // Build mid content
+        let midHtml = "";
+        for (let i = newStart; i <= newEnd; i++) {
+          midHtml += `<div class="vs-block" data-vs="${i}">${vsBlocks[i].html}</div>`;
+        }
+        $("vs-mid").innerHTML = midHtml;
+
+        // Measure rendered blocks
+        $("vs-mid").querySelectorAll(".vs-block").forEach(node => {
+          const idx = parseInt(node.dataset.vs);
+          vsBlocks[idx].height = node.offsetHeight;
+        });
+
+        // Spacers
+        let topH = 0;
+        for (let i = 0; i < newStart; i++) topH += vsBlocks[i].height;
+        let botH = 0;
+        for (let i = newEnd + 1; i < vsBlocks.length; i++) botH += vsBlocks[i].height;
+
+        $("vs-top").style.height = topH + "px";
+        $("vs-bot").style.height = botH + "px";
+
+        vsStart = newStart;
+        vsEnd = newEnd;
+
+        if (scrollToBottom) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+
+      function vsDeactivate() {
+        vsActive = false;
+        vsBlocks = [];
+        vsStart = 0;
+        vsEnd = -1;
+        // Ensure chat-log-live exists inside chat-log
+        if (!$("chat-log-live")) {
+          $("chat-log").insertAdjacentHTML("beforeend", '<div id="chat-log-live"></div>');
+        }
       }
 
       function escapeHtml(value) {
@@ -874,12 +972,23 @@
         }
       }
 
+      function isVirtualScrollEnabled() {
+        return $("virtual_scroll").checked;
+      }
+
       function renderChat(history) {
+        $("chat-log-live").innerHTML = "";
         if (!history || history.length === 0) {
-          setChatLogHtml('<div class="meta">No messages yet.</div>');
+          vsDeactivate();
+          $("chat-log").innerHTML = '<div class="meta">No messages yet.</div><div id="chat-log-live"></div>';
           return;
         }
-        setChatLogHtml(historyToHtml(history));
+        if (isVirtualScrollEnabled()) {
+          vsInit(historyToBlocks(history));
+        } else {
+          vsDeactivate();
+          setChatLogHtml(historyToHtml(history));
+        }
       }
 
       async function streamChatRequest(userInput, continueOnly = false) {
@@ -935,11 +1044,16 @@
 
           // Render base history ONCE into chat-log (static part)
           {
-            let baseHtml = historyToHtml(mergeBaseHistory);
+            const baseBlocks = historyToBlocks(mergeBaseHistory);
             if (!continueOnly) {
-              baseHtml += msgBlock("msg-user", "user", userInput);
+              baseBlocks.push(msgBlock("msg-user", "user", userInput));
             }
-            $("chat-log").innerHTML = baseHtml;
+            if (isVirtualScrollEnabled()) {
+              vsInit(baseBlocks);
+            } else {
+              vsDeactivate();
+              $("chat-log").innerHTML = baseBlocks.join("") + '<div id="chat-log-live"></div>';
+            }
           }
 
           const renderLive = () => {
@@ -973,12 +1087,16 @@
             }
             if (evt.type === "reasoning_delta") {
               addReasoning(evt.content);
+              streamingExtraTokens += roughTokenCount(evt.content);
               renderLive();
+              renderContextSize(" (streaming)");
               return false;
             }
             if (evt.type === "delta") {
               addDelta(evt.content);
+              streamingExtraTokens += roughTokenCount(evt.content);
               renderLive();
+              renderContextSize(" (streaming)");
               return false;
             }
             if (evt.type === "tool_call_start") {
@@ -1016,11 +1134,15 @@
                   arguments: evt.arguments || "{}"
                 });
               }
+              streamingExtraTokens += roughTokenCount(evt.arguments || "{}") + roughTokenCount(evt.tool_name) + 6;
               renderLive();
+              renderContextSize(" (streaming)");
               return false;
             }
             if (evt.type === "tool_result") {
               const output = formatToolOutput(evt.result ?? {});
+              const rawResult = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result ?? {});
+              streamingExtraTokens += roughTokenCount(rawResult) + 4;
               // Extract start_line and attach to the most recent file_edit tool call
               const sl = extractStartLine(evt.result);
               if (sl != null) {
@@ -1032,9 +1154,18 @@
                 output
               });
               renderLive();
+              renderContextSize(" (streaming)");
+              return false;
+            }
+            if (evt.type === "usage") {
+              // Real token counts from the API — replace estimates
+              currentContextTokens = evt.total_tokens;
+              streamingExtraTokens = 0;
+              renderContextSize(" (streaming)");
               return false;
             }
             if (evt.type === "done") {
+              streamingExtraTokens = 0;
               // Commit the exact persisted snapshot hash for this completed message.
               setHashStateUUID(evt.state_uuid, "push");
               await refresh(evt.state_uuid, "none");
@@ -1047,6 +1178,7 @@
             return false;
           };
 
+          streamingExtraTokens = continueOnly ? 0 : roughTokenCount(userInput) + 4;
           renderLive();
           renderContextSize(" (streaming)");
           while (true) {
@@ -1447,6 +1579,28 @@
 
       window.addEventListener("popstate", () => {
         refresh("", "none").catch((err) => setStatus(`History error: ${err.message}`));
+      });
+
+      $("chat-log").addEventListener("scroll", () => {
+        if (!vsActive) return;
+        if (vsScrollRAF) return;
+        vsScrollRAF = requestAnimationFrame(() => {
+          vsScrollRAF = null;
+          vsUpdate(false);
+        });
+      });
+
+      $("virtual_scroll").addEventListener("change", () => {
+        if (cachedState) renderChat(cachedState.history);
+      });
+
+      // Persist virtual scroll preference
+      try {
+        const savedVS = localStorage.getItem("virtualScroll");
+        if (savedVS !== null) $("virtual_scroll").checked = savedVS === "true";
+      } catch(_) {}
+      $("virtual_scroll").addEventListener("change", () => {
+        try { localStorage.setItem("virtualScroll", $("virtual_scroll").checked); } catch(_) {}
       });
 
       refresh().catch((err) => setStatus(`Startup error: ${err.message}`));
