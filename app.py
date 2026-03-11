@@ -1764,16 +1764,6 @@ def chat():
                 tool_result = execute_tool_call(tool_name, cleaned_args, tools, builtin_flags, runtime_ctx)
                 tool_results_this_turn.append((tool_call, tool_name, cleaned_args, tool_result))
 
-            # If ALL tool results are errors, rollback and re-prompt
-            all_errors = all(
-                str(tr.get("output", "")).startswith("Error:") or str(tr.get("output", "")).startswith("ERROR:")
-                for _, _, _, tr in tool_results_this_turn
-            )
-            if all_errors and tool_results_this_turn:
-                if messages and messages[-1].get("role") == "assistant":
-                    messages.pop()
-                continue  # re-prompt without the failed tool calls
-
             for tool_call, tool_name, cleaned_args, tool_result in tool_results_this_turn:
                 tool_trace.append(
                     {
@@ -1904,7 +1894,66 @@ def chat_stream():
                 partial_tool_calls: List[Dict[str, Any]] = []
                 announced_tool_indices: set = set()
 
+                # Start prompt processing progress poller
+                import queue as _queue
+                prompt_progress_q: _queue.Queue = _queue.Queue()
+                prompt_done = threading.Event()
+
+                def _poll_slots():
+                    """Poll llama.cpp /slots endpoint for prompt processing progress."""
+                    import time as _time
+                    base = config.get("base_url", "")
+                    # Strip /v1 suffix to get the llama.cpp server root
+                    server_root = re.sub(r'/v1/?$', '', base)
+                    if not server_root:
+                        return
+                    slots_url = f"{server_root}/slots"
+                    poll_client = httpx.Client(timeout=2.0)
+                    start_time = _time.monotonic()
+                    reported_processing = False
+                    try:
+                        while not prompt_done.is_set():
+                            try:
+                                resp = poll_client.get(slots_url)
+                                if resp.status_code == 200:
+                                    slots = resp.json()
+                                    if isinstance(slots, list) and slots:
+                                        slot = slots[0]
+                                        is_processing = slot.get("is_processing", False)
+                                        elapsed = round(_time.monotonic() - start_time, 1)
+                                        # Look for per-token progress fields (varies by llama.cpp version)
+                                        n_prompt = slot.get("n_prompt_tokens_processed", 0)
+                                        n_total = slot.get("n_prompt_tokens", 0) or slot.get("prompt_tokens", 0)
+                                        prompt_progress_q.put({
+                                            "is_processing": is_processing,
+                                            "elapsed": elapsed,
+                                            "n_prompt": n_prompt,
+                                            "n_total": n_total,
+                                        })
+                                        reported_processing = is_processing
+                            except Exception:
+                                pass
+                            prompt_done.wait(0.5)
+                    finally:
+                        poll_client.close()
+
+                slots_thread = threading.Thread(target=_poll_slots, daemon=True)
+                slots_thread.start()
+                first_token_received = False
+
                 for chunk in completion_stream:
+                    if not first_token_received:
+                        # Drain any prompt progress events and yield them
+                        while not prompt_progress_q.empty():
+                            try:
+                                prog = prompt_progress_q.get_nowait()
+                                yield stream_line({"type": "prompt_progress", **prog})
+                            except _queue.Empty:
+                                break
+                        # Check if this chunk has actual content (not just usage)
+                        if chunk.choices:
+                            first_token_received = True
+                            prompt_done.set()
                     # Extract usage from final chunk
                     usage = getattr(chunk, "usage", None)
                     if usage is not None:
@@ -1954,6 +2003,8 @@ def chat_stream():
                             args_frag = getattr(fn, "arguments", None)
                             if isinstance(args_frag, str) and args_frag:
                                 yield stream_line({"type": "tool_call_delta", "index": idx, "arguments_delta": args_frag})
+
+                prompt_done.set()  # ensure poller stops after stream ends
 
                 content = "".join(content_parts)
                 reasoning = "".join(reasoning_parts)
@@ -2023,20 +2074,6 @@ def chat_stream():
 
                     tool_result = execute_tool_call(tool_name, cleaned_args, tools, builtin_flags, runtime_ctx)
                     tool_results_this_turn.append((tool_call, tool_name, cleaned_args, tool_result))
-
-                # If ALL tool results are errors, rollback and re-prompt
-                all_errors = all(
-                    str(tr.get("output", "")).startswith("Error:") or str(tr.get("output", "")).startswith("ERROR:")
-                    for _, _, _, tr in tool_results_this_turn
-                )
-                if all_errors and tool_results_this_turn:
-                    if messages and messages[-1].get("role") == "assistant":
-                        messages.pop()
-                    yield stream_line({
-                        "type": "rollback",
-                        "reason": "All tool calls returned errors — rolling back and retrying.",
-                    })
-                    continue  # re-prompt
 
                 for tool_call, tool_name, cleaned_args, tool_result in tool_results_this_turn:
                     yield stream_line(

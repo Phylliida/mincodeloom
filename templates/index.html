@@ -1638,6 +1638,15 @@
               setHashStateUUID(evt.state_uuid, "replace");
               return false;
             }
+            if (evt.type === "prompt_progress") {
+              if (evt.n_total > 0 && evt.n_prompt > 0) {
+                const pct = Math.round(100 * evt.n_prompt / evt.n_total);
+                setStatus(`processing prompt... ${evt.n_prompt}/${evt.n_total} tokens (${pct}%)`);
+              } else if (evt.is_processing) {
+                setStatus(`processing prompt... ${evt.elapsed}s`);
+              }
+              return false;
+            }
             if (evt.type === "reasoning_delta") {
               if (streamPhase === "processing input") { streamPhase = "thinking"; setStatus("thinking..."); }
               addReasoning(evt.content);
