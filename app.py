@@ -1114,6 +1114,14 @@ def sanitize_tool_args(raw_args: str) -> Tuple[str, bool]:
     return json.dumps(cleaned, ensure_ascii=False), is_junk
 
 
+def _is_missing_param_error(result: Dict[str, Any]) -> bool:
+    """Check if a tool result is a 'missing required parameter' validation error."""
+    output = str(result.get("output", ""))
+    lower = output.lower()
+    return ("required" in lower and ("null" in lower or "empty" in lower)) or \
+           ("is required" in lower)
+
+
 def execute_tool_call(
     tool_name: str,
     raw_args: str,
@@ -1155,7 +1163,7 @@ def execute_tool_call(
                 srv_tool_names = [t.get("name") for t in client.list_tools()]
                 if tool_name in srv_tool_names:
                     result_text = client.call_tool(tool_name, parsed_args)
-                    return {"output": clip_text(result_text)}
+                    return {"output": result_text}
             except Exception as exc:  # noqa: BLE001
                 return {"output": f"ERROR: MCP '{srv_name}' tool '{tool_name}': {exc}"}
 
@@ -1764,6 +1772,15 @@ def chat():
                 tool_result = execute_tool_call(tool_name, cleaned_args, tools, builtin_flags, runtime_ctx)
                 tool_results_this_turn.append((tool_call, tool_name, cleaned_args, tool_result))
 
+            # Rollback if every tool call hit a missing-param validation error
+            # (model forgot a required arg — retry instead of polluting context).
+            if tool_results_this_turn and all(
+                _is_missing_param_error(r) for _, _, _, r in tool_results_this_turn
+            ):
+                if messages and messages[-1].get("role") == "assistant":
+                    messages.pop()
+                continue  # re-prompt
+
             for tool_call, tool_name, cleaned_args, tool_result in tool_results_this_turn:
                 tool_trace.append(
                     {
@@ -2074,6 +2091,19 @@ def chat_stream():
 
                     tool_result = execute_tool_call(tool_name, cleaned_args, tools, builtin_flags, runtime_ctx)
                     tool_results_this_turn.append((tool_call, tool_name, cleaned_args, tool_result))
+
+                # Rollback if every tool call hit a missing-param validation error
+                # (model forgot a required arg — retry instead of polluting context).
+                if tool_results_this_turn and all(
+                    _is_missing_param_error(r) for _, _, _, r in tool_results_this_turn
+                ):
+                    if messages and messages[-1].get("role") == "assistant":
+                        messages.pop()
+                    yield stream_line({
+                        "type": "rollback",
+                        "reason": "Tool call missing required parameter — rolling back and retrying.",
+                    })
+                    continue  # re-prompt
 
                 for tool_call, tool_name, cleaned_args, tool_result in tool_results_this_turn:
                     yield stream_line(
