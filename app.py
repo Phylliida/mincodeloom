@@ -146,6 +146,124 @@ DEFAULT_STATE: Dict[str, Any] = {
 app = Flask(__name__)
 
 
+# ---------------------------------------------------------------------------
+# In-memory event cache — avoids re-reading the entire (potentially huge)
+# events.jsonl on every request.  Tracks file size so only *new* bytes
+# appended since the last read are parsed.
+# ---------------------------------------------------------------------------
+
+class _EventCache:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: List[Dict[str, Any]] = []
+        self._file_size: int = 0  # bytes consumed so far
+        # Tree index (built incrementally)
+        self._by_uuid: Dict[str, Dict[str, Any]] = {}
+        self._children_map: Dict[str, List[Tuple[str, str]]] = {}  # parent -> [(ts, uuid)]
+        self._last_child_map: Dict[str, str] = {}
+        self._sorted_children: Dict[str, List[str]] = {}  # parent -> [uuid] sorted
+        self._dirty_parents: set = set()  # parents needing re-sort
+        # Append-side bookkeeping
+        self._last_state_hash: str = ""
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _ingest_event(self, ev: Dict[str, Any]) -> None:
+        """Index a single event into the cache structures."""
+        self._events.append(ev)
+
+        action = ev.get("action")
+        if action == "last_child_visited":
+            parent = ev.get("parent_state_uuid")
+            child = ev.get("child_state_uuid")
+            if parent and child:
+                self._last_child_map[parent] = child
+            return
+
+        suuid = ev.get("state_uuid")
+        if not suuid:
+            return
+        self._by_uuid[suuid] = ev
+        parent = ev.get("parent_state_uuid")
+        if parent:
+            self._children_map.setdefault(parent, []).append(
+                (ev.get("timestamp", ""), suuid)
+            )
+            self._dirty_parents.add(parent)
+
+        if "state_hash" in ev:
+            self._last_state_hash = ev["state_hash"]
+
+    def _flush_dirty(self) -> None:
+        """Re-sort only the parent children lists that changed."""
+        for parent in self._dirty_parents:
+            kids = self._children_map.get(parent, [])
+            kids.sort()
+            self._sorted_children[parent] = [k[1] for k in kids]
+        self._dirty_parents.clear()
+
+    # -- public API ---------------------------------------------------------
+
+    def sync(self) -> None:
+        """Read any new bytes appended to the event log since last sync."""
+        with self._lock:
+            if not EVENT_LOG_PATH.exists():
+                return
+            current_size = EVENT_LOG_PATH.stat().st_size
+            if current_size <= self._file_size:
+                return
+            with EVENT_LOG_PATH.open("r", encoding="utf-8") as fh:
+                fh.seek(self._file_size)
+                tail = fh.read()
+            self._file_size = current_size
+            for line in tail.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        self._ingest_event(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            self._flush_dirty()
+
+    def get_all(self) -> Tuple[
+        List[Dict[str, Any]],
+        Dict[str, Dict[str, Any]],
+        Dict[str, List[str]],
+        Dict[str, str],
+    ]:
+        """Return (events, by_uuid, sorted_children, last_child_map)."""
+        self.sync()
+        with self._lock:
+            return (
+                self._events,
+                self._by_uuid,
+                self._sorted_children,
+                self._last_child_map,
+            )
+
+    @property
+    def last_state_hash(self) -> str:
+        self.sync()
+        with self._lock:
+            return self._last_state_hash
+
+    @property
+    def event_count(self) -> int:
+        self.sync()
+        with self._lock:
+            return len(self._events)
+
+    def ingest_and_track(self, event: Dict[str, Any], raw_bytes: int) -> None:
+        """Ingest a just-appended event without re-reading the file."""
+        with self._lock:
+            self._ingest_event(event)
+            self._file_size += raw_bytes
+            self._flush_dirty()
+
+
+_cache = _EventCache()
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -160,26 +278,18 @@ def compute_state_identity(state: Dict[str, Any], prev_state_hash: str, next_eve
 
 
 def read_all_events() -> List[Dict[str, Any]]:
-    if not EVENT_LOG_PATH.exists():
-        return []
-    events: List[Dict[str, Any]] = []
-    with EVENT_LOG_PATH.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    return events
+    """Kept for compatibility — now backed by the cache."""
+    _cache.sync()
+    return _cache._events
 
 
 def append_action_record(action: str, **kwargs: Any) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     record = {"action": action, "timestamp": utc_now_iso(), **kwargs}
+    raw = json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
     with EVENT_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True))
-        handle.write("\n")
+        handle.write(raw)
+    _cache.ingest_and_track(record, len(raw.encode("utf-8")))
 
 
 def append_state_snapshot(
@@ -189,13 +299,8 @@ def append_state_snapshot(
     parent_state_uuid: str | None = None,
 ) -> Dict[str, Any]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    events = read_all_events()
-    prev_state_hash = ""
-    for ev in reversed(events):
-        if "state_hash" in ev:
-            prev_state_hash = ev["state_hash"]
-            break
-    next_event_index = len(events) + 1
+    prev_state_hash = _cache.last_state_hash
+    next_event_index = _cache.event_count + 1
     state_hash, state_uuid = compute_state_identity(state, prev_state_hash, next_event_index)
     event = {
         "event_id": str(uuid.uuid4()),
@@ -208,9 +313,10 @@ def append_state_snapshot(
         "parent_state_uuid": parent_state_uuid,
         "state": state,
     }
+    raw = json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n"
     with EVENT_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True))
-        handle.write("\n")
+        handle.write(raw)
+    _cache.ingest_and_track(event, len(raw.encode("utf-8")))
     return event
 
 
@@ -329,8 +435,7 @@ def build_tree_index(events: List[Dict[str, Any]]) -> Tuple[
 
 def load_state(state_uuid: str | None = None) -> Tuple[Dict[str, Any], Dict[str, Any], int, Dict[str, Any]]:
     ensure_store()
-    events = read_all_events()
-    by_uuid, children_map, last_child_map = build_tree_index(events)
+    events, by_uuid, children_map, last_child_map = _cache.get_all()
 
     if not state_uuid:
         # Find the latest actual state event (not an action record)
