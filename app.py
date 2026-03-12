@@ -132,9 +132,11 @@ DEFAULT_BUILTIN_TOOLS = {name: False for name in BUILTIN_TOOL_SPECS}
 
 DEFAULT_STATE: Dict[str, Any] = {
     "config": {
+        "provider": "local",
         "base_url": "http://localhost:8000/v1",
         "api_key": "",
         "model": "Qwen3-Coder-Next",
+        "rollback_invalid_tool_calls": True,
         "workspace_path": DEFAULT_WORKSPACE_PATH,
         "builtin_tools": copy.deepcopy(DEFAULT_BUILTIN_TOOLS),
         "mcp_servers": {},
@@ -351,10 +353,15 @@ def normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         config = {}
         state["config"] = config
 
-    for key in ["base_url", "api_key", "model", "workspace_path"]:
+    for key in ["provider", "base_url", "api_key", "model", "workspace_path"]:
         value = config.get(key)
         if not isinstance(value, str):
             config[key] = str(DEFAULT_STATE["config"][key])
+
+    for key in ["rollback_invalid_tool_calls"]:
+        value = config.get(key)
+        if not isinstance(value, bool):
+            config[key] = DEFAULT_STATE["config"][key]
 
     incoming_builtin = config.get("builtin_tools")
     normalized_builtin = copy.deepcopy(DEFAULT_BUILTIN_TOOLS)
@@ -1385,9 +1392,14 @@ def save_config():
     config = state["config"]
 
     updated_fields: List[str] = []
-    for key in ["base_url", "api_key", "model"]:
+    for key in ["provider", "base_url", "api_key", "model"]:
         if key in payload and isinstance(payload[key], str):
             config[key] = payload[key].strip()
+            updated_fields.append(key)
+
+    for key in ["rollback_invalid_tool_calls"]:
+        if key in payload and isinstance(payload[key], bool):
+            config[key] = payload[key]
             updated_fields.append(key)
 
     if "workspace_path" in payload:
@@ -1654,6 +1666,53 @@ def append_history():
     )
 
 
+def make_llm_client(config: Dict[str, Any]) -> OpenAI:
+    api_key = config.get("api_key", "")
+    base_url = config["base_url"]
+    kwargs: Dict[str, Any] = {
+        "base_url": base_url,
+        "api_key": api_key or "EMPTY",
+        "timeout": httpx.Timeout(None, connect=10.0),
+    }
+    if "openrouter.ai" in base_url:
+        kwargs["default_headers"] = {
+            "HTTP-Referer": "https://github.com/mincodeloom",
+            "X-Title": "mincodeloom",
+        }
+    return OpenAI(**kwargs)
+
+
+@app.get("/api/openrouter/models")
+def openrouter_models():
+    state, _, _, _ = load_state()
+    api_key = state["config"].get("api_key", "")
+    if not api_key:
+        return jsonify({"ok": False, "error": "API key is required for OpenRouter"}), 400
+    try:
+        resp = httpx.get(
+            "https://openrouter.ai/api/v1/models?supported_parameters=tools",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        models = sorted(
+            [
+                {
+                    "id": m["id"],
+                    "name": m.get("name", m["id"]),
+                    "context_length": m.get("context_length"),
+                    "pricing": m.get("pricing"),
+                }
+                for m in data
+            ],
+            key=lambda m: m["name"].lower(),
+        )
+        return jsonify({"ok": True, "models": models})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
 @app.post("/api/compact")
 def compact():
     payload = request.get_json(silent=True) or {}
@@ -1674,12 +1733,7 @@ def compact():
     @stream_with_context
     def generate():
         try:
-            api_key = config.get("api_key", "")
-            client = OpenAI(
-                base_url=config["base_url"],
-                api_key=api_key or "EMPTY",
-                timeout=httpx.Timeout(None, connect=10.0),
-            )
+            client = make_llm_client(config)
             completion_stream = client.chat.completions.create(
                 messages=clean_messages_for_api(messages),
                 model=config["model"],
@@ -1800,8 +1854,7 @@ def chat():
     runtime_ctx["mcp_servers"] = mcp_servers
 
     try:
-        api_key = config.get("api_key", "")
-        client = OpenAI(base_url=config["base_url"], api_key=api_key or "EMPTY", timeout=httpx.Timeout(None, connect=10.0))
+        client = make_llm_client(config)
         while True:
             request_args: Dict[str, Any] = {
                 "messages": clean_messages_for_api(messages),
@@ -1848,6 +1901,8 @@ def chat():
                 final_reply = content
                 break
 
+            rollback_enabled = config.get("rollback_invalid_tool_calls", True)
+
             # Check for null-spam tool calls and rollback if needed
             has_junk = False
             for tool_call in tool_calls:
@@ -1857,7 +1912,7 @@ def chat():
                     has_junk = True
                     break
 
-            if has_junk:
+            if has_junk and rollback_enabled:
                 if messages and messages[-1].get("role") == "assistant":
                     messages.pop()
                 continue  # re-prompt
@@ -1879,7 +1934,7 @@ def chat():
 
             # Rollback if every tool call hit a missing-param validation error
             # (model forgot a required arg — retry instead of polluting context).
-            if tool_results_this_turn and all(
+            if rollback_enabled and tool_results_this_turn and all(
                 _is_missing_param_error(r) for _, _, _, r in tool_results_this_turn
             ):
                 if messages and messages[-1].get("role") == "assistant":
@@ -1979,8 +2034,7 @@ def chat_stream():
     def generate():
         nonlocal final_reply, merge_continue
         try:
-            api_key = config.get("api_key", "")
-            client = OpenAI(base_url=config["base_url"], api_key=api_key or "EMPTY", timeout=httpx.Timeout(None, connect=10.0))
+            client = make_llm_client(config)
             current_parent_uuid = parent_event["state_uuid"]
 
             def save_progress(action_detail: Dict[str, Any]) -> Dict[str, Any]:
@@ -2159,6 +2213,8 @@ def chat_stream():
                     final_reply = content
                     break
 
+                rollback_enabled = config.get("rollback_invalid_tool_calls", True)
+
                 # Check for null-spam tool calls and rollback if needed
                 has_junk = False
                 for tool_call in tool_calls:
@@ -2168,7 +2224,7 @@ def chat_stream():
                         has_junk = True
                         break
 
-                if has_junk:
+                if has_junk and rollback_enabled:
                     # Rollback: remove the assistant message we just appended
                     if messages and messages[-1].get("role") == "assistant":
                         messages.pop()
@@ -2199,7 +2255,7 @@ def chat_stream():
 
                 # Rollback if every tool call hit a missing-param validation error
                 # (model forgot a required arg — retry instead of polluting context).
-                if tool_results_this_turn and all(
+                if rollback_enabled and tool_results_this_turn and all(
                     _is_missing_param_error(r) for _, _, _, r in tool_results_this_turn
                 ):
                     if messages and messages[-1].get("role") == "assistant":

@@ -37,7 +37,7 @@
         box-sizing: border-box;
         font: inherit;
       }
-      input, textarea {
+      input, textarea, select {
         border: 1px solid #334155;
         border-radius: 6px;
         padding: 8px;
@@ -318,6 +318,14 @@
         <summary><h2>Config</h2></summary>
         <form id="config-form">
           <label>
+            Provider
+            <select id="provider">
+              <option value="local">Local (llama.cpp / vLLM)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="custom">Custom OpenAI-compatible</option>
+            </select>
+          </label>
+          <label id="base_url_label">
             Base URL
             <input id="base_url" required>
           </label>
@@ -329,9 +337,17 @@
             Workspace Path
             <input id="workspace_path" placeholder="/path/to/project">
           </label>
-          <label>
+          <label id="model_label">
             Model
             <input id="model" required>
+          </label>
+          <label id="model_picker_label" style="display:none">
+            Model
+            <select id="model_picker"><option value="">Loading models...</option></select>
+          </label>
+          <label class="checkbox-row" style="margin-top:8px">
+            <input id="rollback_invalid_tool_calls" type="checkbox" checked>
+            <span>Rollback invalid tool calls</span>
           </label>
           <div class="checkbox-grid">
             <label class="checkbox-row">
@@ -1881,10 +1897,13 @@
         renderToolList(cachedState.tools, cachedState.config.builtin_tools || {});
         renderChat(cachedState.history);
 
+        $("provider").value = cachedState.config.provider || "local";
         $("base_url").value = cachedState.config.base_url;
         $("api_key").value = cachedState.config.api_key;
         $("workspace_path").value = cachedState.config.workspace_path || "";
         $("model").value = cachedState.config.model;
+        $("rollback_invalid_tool_calls").checked = cachedState.config.rollback_invalid_tool_calls !== false;
+        await onProviderChange(true);
         const builtin = cachedState.config.builtin_tools || {};
         $("builtin_pwd").checked = Boolean(builtin.pwd);
         $("builtin_ls").checked = Boolean(builtin.ls);
@@ -1904,12 +1923,57 @@
       }
 
       let configSaveTimer = null;
+      let openrouterModelsCache = null;
+
+      async function onProviderChange(skipSave) {
+        const provider = $("provider").value;
+        if (provider === "openrouter") {
+          $("base_url_label").style.display = "none";
+          $("base_url").value = "https://openrouter.ai/api/v1";
+          $("model_label").style.display = "none";
+          $("model_picker_label").style.display = "";
+          if (!openrouterModelsCache) {
+            $("model_picker").innerHTML = '<option value="">Loading models...</option>';
+            try {
+              const payload = await api("/api/openrouter/models");
+              openrouterModelsCache = payload.models || [];
+            } catch (err) {
+              $("model_picker").innerHTML = `<option value="">Error: ${escapeHtml(err.message)}</option>`;
+              return;
+            }
+          }
+          const currentModel = $("model").value;
+          let html = "";
+          for (const m of openrouterModelsCache) {
+            const sel = m.id === currentModel ? " selected" : "";
+            const ctx = m.context_length ? ` (${(m.context_length/1024).toFixed(0)}k)` : "";
+            html += `<option value="${escapeHtml(m.id)}"${sel}>${escapeHtml(m.name)}${ctx}</option>`;
+          }
+          $("model_picker").innerHTML = html;
+          if (!currentModel && openrouterModelsCache.length > 0) {
+            $("model").value = openrouterModelsCache[0].id;
+          }
+        } else {
+          $("model_label").style.display = "";
+          $("model_picker_label").style.display = "none";
+          if (provider === "local") {
+            $("base_url_label").style.display = "";
+          } else {
+            // custom
+            $("base_url_label").style.display = "";
+          }
+        }
+        if (!skipSave) scheduleConfigSave();
+      }
+
       function gatherConfig() {
         return {
+          provider: $("provider").value,
           base_url: $("base_url").value.trim(),
           api_key: $("api_key").value.trim(),
           workspace_path: $("workspace_path").value.trim(),
           model: $("model").value.trim(),
+          rollback_invalid_tool_calls: $("rollback_invalid_tool_calls").checked,
           builtin_tools: {
             pwd: $("builtin_pwd").checked,
             ls: $("builtin_ls").checked,
@@ -1939,12 +2003,17 @@
         event.preventDefault();
         autoSaveConfig();
       });
-      for (const id of ["builtin_pwd", "builtin_ls", "builtin_rg", "builtin_rg_files", "builtin_browse", "builtin_read_file", "builtin_file_edit"]) {
+      for (const id of ["builtin_pwd", "builtin_ls", "builtin_rg", "builtin_rg_files", "builtin_browse", "builtin_read_file", "builtin_file_edit", "rollback_invalid_tool_calls"]) {
         $(id).addEventListener("change", scheduleConfigSave);
       }
       for (const id of ["base_url", "api_key", "workspace_path", "model"]) {
         $(id).addEventListener("change", scheduleConfigSave);
       }
+      $("provider").addEventListener("change", () => onProviderChange(false));
+      $("model_picker").addEventListener("change", () => {
+        $("model").value = $("model_picker").value;
+        scheduleConfigSave();
+      });
 
       $("tool-form").addEventListener("submit", async (event) => {
         event.preventDefault();
